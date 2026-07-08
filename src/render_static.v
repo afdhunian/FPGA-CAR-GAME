@@ -29,8 +29,17 @@ module render_static (
 
     // How fast the world scrolls toward the camera each frame -- used by
     // both the road curve timing below and the dashed-line/tree motion
-    // further down.
+    // further down. This is the BASE rate; world_scroll_speed (below)
+    // adds the same difficulty bonus OBSTACLE_SPEED gets, so the road
+    // and trees visibly speed up right along with the obstacles instead
+    // of staying at a fixed pace while only the obstacles get faster.
     localparam SCROLL_SPEED = 10'd3;
+
+    // Actual scroll rate applied to seg_dist/scroll_y below.
+    // obstacle_speed_bonus is declared further down (next to
+    // OBSTACLE_SPEED) but that's fine -- it's a plain wire, so the
+    // forward reference resolves normally in Verilog.
+    wire [9:0] world_scroll_speed = SCROLL_SPEED + obstacle_speed_bonus;
 
     // Road converges toward a narrow point at the horizon and widens
     // toward the camera. ROAD_HALF_FAR is the half-width right at the
@@ -91,8 +100,8 @@ module render_static (
             curve_update_counter <= 8'd0;
             current_curve_max    <= CURVE_MAX_START;
         end else if (x == 10'd0 && y == 10'd0 && !game_over) begin   // once per frame, freeze on game over
-            if (seg_dist + SCROLL_SPEED >= SEGMENT_LENGTH) begin
-                seg_dist <= (seg_dist + SCROLL_SPEED) - SEGMENT_LENGTH;
+            if (seg_dist + world_scroll_speed >= SEGMENT_LENGTH) begin
+                seg_dist <= (seg_dist + world_scroll_speed) - SEGMENT_LENGTH;
 
                 // Completing PHASE_LEFT means the next phase wraps back
                 // to PHASE_STRAIGHT_1 -- i.e. a full loop just finished.
@@ -102,7 +111,7 @@ module render_static (
 
                 phase <= phase + 2'd1;      // wraps 0,1,2,3,0,... automatically
             end else begin
-                seg_dist <= seg_dist + SCROLL_SPEED;
+                seg_dist <= seg_dist + world_scroll_speed;
             end
 
             if (curve_update_counter >= CURVE_UPDATE_DIVIDER - 8'd1) begin
@@ -206,15 +215,17 @@ module render_static (
     // real driving game, the world moves past the car instead of the
     // car moving through the world.
     //
-    // SCROLL_SPEED (declared earlier, next to the curve timer) controls
-    // how fast the road appears to move: bigger = faster.
+    // SCROLL_SPEED (declared earlier, next to the curve timer) is the base
+    // rate; world_scroll_speed adds the same difficulty bonus obstacles
+    // get, so the trees/dashes/asphalt appear to speed up right along
+    // with the obstacles as the score climbs.
     reg [9:0] scroll_y;
 
     always @(posedge clk) begin
         if (reset)
             scroll_y <= 10'd0;
         else if (x == 10'd0 && y == 10'd0 && !game_over)
-            scroll_y <= scroll_y + SCROLL_SPEED;
+            scroll_y <= scroll_y + world_scroll_speed;
     end
 
     // NOTE: subtract, not add. Sampling the pattern at (y - scroll_y)
@@ -225,6 +236,15 @@ module render_static (
     wire [9:0] anim_y = y - scroll_y;
 
     assign asphalt_fleck = x[1] ^ x[4] ^ anim_y[2] ^ anim_y[5];
+
+    // Fine per-pixel color variation for the grass -- same cheap
+    // XOR-speckle idiom as asphalt_fleck, just two independent bit
+    // combos so there are 4 close, subtle shades instead of one flat
+    // block of color. Deliberately fine-grained (low-order bits), not
+    // big blocks, so it reads as texture/noise rather than patches.
+    wire grass_speck_a, grass_speck_b;
+    assign grass_speck_a = x[0] ^ anim_y[0];
+    assign grass_speck_b = x[2] ^ anim_y[2];
 
     // Wrap a tree's base y-position (ty) forward by scroll_y, looping
     // back to the horizon once it would scroll past the bottom of the
@@ -640,7 +660,7 @@ localparam CAR_W = 10'd128;
     wire [15:0] speed_tier_raw = score / OBSTACLE_SPEEDUP_SCORE;
     wire [9:0]  obstacle_speed_bonus = (speed_tier_raw > {6'd0, OBSTACLE_SPEED_MAX_BONUS}) ?
                                         OBSTACLE_SPEED_MAX_BONUS : speed_tier_raw[9:0];
-    wire [9:0] OBSTACLE_SPEED = SCROLL_SPEED + obstacle_speed_bonus; // travels at road speed + difficulty bonus
+    wire [9:0] OBSTACLE_SPEED = world_scroll_speed; // same rate the road/trees now scroll at, so everything speeds up together
 
     // CAR_STEP naik pakai bonus YANG SAMA persis dengan OBSTACLE_SPEED
     // (bukan formula terpisah), jadi keduanya selalu "mengejar" satu
@@ -1293,12 +1313,16 @@ localparam CAR_W = 10'd128;
             end
 
             else begin
-                // Grass: desaturated teal-green with blue pulled up
-                // close to green, instead of a saturated summer green
-                // -- reads as dusk-lit meadow, same family as the sky.
-                terrain_r = 8'd58;
-                terrain_g = 8'd112;
-                terrain_b = 8'd124;
+                // Grass: 4 close, subtle teal-green shades picked
+                // per-pixel by grass_speck_a/b, instead of one flat
+                // block of color -- breaks up the "solid green carpet"
+                // look without changing the overall dusk-meadow hue.
+                case ({grass_speck_a, grass_speck_b})
+                    2'b00: begin terrain_r = 8'd52; terrain_g = 8'd104; terrain_b = 8'd116; end
+                    2'b01: begin terrain_r = 8'd58; terrain_g = 8'd112; terrain_b = 8'd124; end
+                    2'b10: begin terrain_r = 8'd64; terrain_g = 8'd120; terrain_b = 8'd132; end
+                    default: begin terrain_r = 8'd70; terrain_g = 8'd128; terrain_b = 8'd140; end
+                endcase
             end
 
             // ---- Horizon fade: for the first few rows below the
