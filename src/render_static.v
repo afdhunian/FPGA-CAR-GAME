@@ -6,6 +6,7 @@ module render_static (
     input  wire [9:0] y,
     input  wire       steer_left,   // active-high: hold to move the car left
     input  wire       steer_right,  // active-high: hold to move the car right
+    input  wire       start_btn,    // active-high: press once to begin from the start screen
     output reg  [7:0] red,
     output reg  [7:0] green,
     output reg  [7:0] blue,
@@ -17,6 +18,30 @@ module render_static (
                                     // block for score/lives/game-over -- it will
                                     // only be high for a single clk, not held.
 );
+
+    // ------------------------------------------------------------------
+    // Start screen: nothing in the world moves/updates until the player
+    // presses start_btn for the first time. Same freeze mechanism as
+    // game_over (every world-state always block below checks BOTH
+    // !game_over and game_started), so this reuses that pattern rather
+    // than adding a whole separate code path.
+    // ------------------------------------------------------------------
+    reg game_started;
+    reg start_btn_prev;
+    initial game_started   = 1'b0;
+    initial start_btn_prev = 1'b0;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            game_started   <= 1'b0;
+            start_btn_prev <= 1'b0;
+        end else if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
+            start_btn_prev <= start_btn;
+            if (!game_started && start_btn && !start_btn_prev)
+                game_started <= 1'b1;
+        end
+    end
+
 
     wire [9:0] dy;
     wire [9:0] road_left;
@@ -99,7 +124,7 @@ module render_static (
             curve_amount         <= 5'sd0;
             curve_update_counter <= 8'd0;
             current_curve_max    <= CURVE_MAX_START;
-        end else if (x == 10'd0 && y == 10'd0 && !game_over) begin   // once per frame, freeze on game over
+        end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin   // once per frame, freeze on game over / before start
             if (seg_dist + world_scroll_speed >= SEGMENT_LENGTH) begin
                 seg_dist <= (seg_dist + world_scroll_speed) - SEGMENT_LENGTH;
 
@@ -224,7 +249,7 @@ module render_static (
     always @(posedge clk) begin
         if (reset)
             scroll_y <= 10'd0;
-        else if (x == 10'd0 && y == 10'd0 && !game_over)
+        else if (x == 10'd0 && y == 10'd0 && !game_over && game_started)
             scroll_y <= scroll_y + world_scroll_speed;
     end
 
@@ -575,7 +600,9 @@ localparam CAR_W = 10'd128;
     wire signed [10:0] car_offset_max_eff = (offset_max_road < CAR_OFFSET_MAX) ? offset_max_road : CAR_OFFSET_MAX;
 
     always @(posedge clk) begin
-        if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
+        if (reset) begin
+            car_offset <= 11'sd0;
+        end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin   // sekali per frame
             if (steer_left && !steer_right) begin
                 if ((car_offset - CAR_STEP) < car_offset_min_eff)
                     car_offset <= car_offset_min_eff;
@@ -673,6 +700,20 @@ localparam CAR_W = 10'd128;
     reg [1:0] obstacle_lane;   // 0 = kiri, 1 = tengah, 2 = kanan (3 tidak dipakai)
     reg [7:0] obstacle_rand;   // 8-bit LFSR, sampled at respawn for a pseudo-random lane
     reg       obstacle_overlap_prev; // overlap state one frame ago, for edge detection
+
+    // ------------------------------------------------------------------
+    // Lives: 3 chances instead of instant game over. Each hit costs one
+    // life AND LIFE_LOST_PENALTY points (which also naturally lowers
+    // obstacle_speed_bonus/difficulty since that's derived straight
+    // from `score` -- no separate "slow back down" logic needed, it
+    // falls out of the existing difficulty formula for free). Only the
+    // hit that takes the LAST life actually sets game_over.
+    // ------------------------------------------------------------------
+    localparam [1:0]  LIVES_START       = 2'd3;
+    localparam [15:0] LIFE_LOST_PENALTY = 16'd10;
+
+    reg [1:0] lives;
+    initial lives = LIVES_START;
 
     initial obstacle_y            = OBS_Y_START;
     initial obstacle_lane         = 2'd1;
@@ -811,7 +852,8 @@ localparam CAR_W = 10'd128;
             score                 <= 16'd0;
             game_over              <= 1'b0;
             combo_count            <= 8'd0;
-        end else if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
+            lives                  <= LIVES_START;
+        end else if (x == 10'd0 && y == 10'd0 && game_started) begin   // sekali per frame, tapi cuma setelah start ditekan
             // 8-bit maximal-length Fibonacci LFSR (taps 8,6,5,4).
             // Advancing this by a fixed number of steps each respawn
             // still lands on many different pseudo-random states,
@@ -822,12 +864,21 @@ localparam CAR_W = 10'd128;
             collision <= collision_edge;
 
             if (!game_over) begin
-                // A crash ends the game immediately -- game_over stays
-                // high until the next reset. A crash also breaks the
-                // combo streak back down to zero.
+                // A crash costs one life AND some points (which also
+                // quietly lowers the difficulty back down a notch,
+                // since obstacle_speed_bonus is derived straight from
+                // `score`) -- game_over only latches once lives hits 0.
+                // Either way the combo streak breaks back to zero.
                 if (collision_edge) begin
-                    game_over   <= 1'b1;
                     combo_count <= 8'd0;
+                    score       <= (score >= LIFE_LOST_PENALTY) ? (score - LIFE_LOST_PENALTY) : 16'd0;
+
+                    if (lives <= 2'd1) begin
+                        lives     <= 2'd0;
+                        game_over <= 1'b1;
+                    end else begin
+                        lives <= lives - 2'd1;
+                    end
                 end else if (obstacle_reached_end) begin
                     // Made it past this obstacle without hitting it --
                     // award points (base + current combo bonus) and
@@ -847,8 +898,13 @@ localparam CAR_W = 10'd128;
                     obstacle_y <= obstacle_y + OBSTACLE_SPEED;
                 end
             end
-            // if game_over is already high, obstacle/score are frozen
-            // in place until reset is asserted.
+            // if game_over is already high, obstacle/score/lives are
+            // frozen in place until reset is asserted.
+        end else if (x == 10'd0 && y == 10'd0) begin
+            // Belum start_btn ditekan: obstacle_rand tetap dianggurkan,
+            // tapi collision harus tetap di-clear supaya tidak nyangkut
+            // tinggi kalau reset dilepas persis di tengah frame ganjil.
+            collision <= 1'b0;
         end else begin
             collision <= 1'b0;   // cuma tinggi persis 1 clock tepat di frame tick tadi
         end
@@ -1019,6 +1075,14 @@ localparam CAR_W = 10'd128;
                     3'd0: r=5'b01110; 3'd1: r=5'b00100; 3'd2: r=5'b00100; 3'd3: r=5'b00100;
                     3'd4: r=5'b00100; 3'd5: r=5'b00100; 3'd6: r=5'b01110; default: r=5'b00000;
                     endcase
+                5'd20: case(row) // 'S'
+                    3'd0: r=5'b01111; 3'd1: r=5'b10000; 3'd2: r=5'b10000; 3'd3: r=5'b01110;
+                    3'd4: r=5'b00001; 3'd5: r=5'b00001; 3'd6: r=5'b11110; default: r=5'b00000;
+                    endcase
+                5'd21: case(row) // 'T'
+                    3'd0: r=5'b11111; 3'd1: r=5'b00100; 3'd2: r=5'b00100; 3'd3: r=5'b00100;
+                    3'd4: r=5'b00100; 3'd5: r=5'b00100; 3'd6: r=5'b00100; default: r=5'b00000;
+                    endcase
                 default: r = 5'b00000; // 17 = space, or anything unmapped
             endcase
             glyph_row = r;
@@ -1040,6 +1104,21 @@ localparam CAR_W = 10'd128;
                 4'd7: gameover_char = 5'd13; // E
                 4'd8: gameover_char = 5'd16; // R
                 default: gameover_char = 5'd17;
+            endcase
+        end
+    endfunction
+
+    // Which glyph goes in each of the 5 "START" character slots.
+    function [4:0] start_char;
+        input [3:0] idx;
+        begin
+            case (idx)
+                4'd0: start_char = 5'd20; // S
+                4'd1: start_char = 5'd21; // T
+                4'd2: start_char = 5'd11; // A
+                4'd3: start_char = 5'd16; // R
+                4'd4: start_char = 5'd21; // T
+                default: start_char = 5'd17;
             endcase
         end
     endfunction
@@ -1186,6 +1265,61 @@ localparam CAR_W = 10'd128;
     wire [4:0] go_glyph_row = glyph_row(gameover_char(go_char_idx), go_row);
     wire go_glyph_bit = in_go_box && (go_col < 3'd5) && (go_row < 3'd7) &&
                         go_glyph_row[4 - go_col];
+
+    // ---- "START" banner: same 32x32-cell style as GAME OVER, just 5
+    // characters instead of 9, shown only before the player has
+    // pressed start_btn for the first time.
+    localparam ST_CHARS = 4'd5;
+    localparam ST_X0 = (10'd640 - ST_CHARS * 10'd32) >> 1; // centered horizontally
+    localparam ST_Y0 = GO_Y0;                                // same vertical spot GAME OVER uses
+
+    wire in_st_box = !game_started &&
+                     (x >= ST_X0) && (x < ST_X0 + (ST_CHARS * 10'd32)) &&
+                     (y >= ST_Y0) && (y < ST_Y0 + 10'd32);
+
+    wire [9:0] st_xrel = x - ST_X0;
+    wire [9:0] st_yrel = y - ST_Y0;
+    wire [3:0] st_char_idx = st_xrel[9:5];
+    wire [2:0] st_col      = st_xrel[4:0] >> 2;
+    wire [2:0] st_row      = st_yrel[4:0] >> 2;
+
+    wire [4:0] st_glyph_row = glyph_row(start_char(st_char_idx), st_row);
+    wire st_glyph_bit = in_st_box && (st_col < 3'd5) && (st_row < 3'd7) &&
+                        st_glyph_row[4 - st_col];
+
+    wire in_st_panel = !game_started &&
+                       (x >= ST_X0 - SCORE_PANEL_MARGIN) && (x < ST_X0 + (ST_CHARS * 10'd32) + SCORE_PANEL_MARGIN) &&
+                       (y >= ST_Y0 - SCORE_PANEL_MARGIN) && (y < ST_Y0 + 10'd32 + SCORE_PANEL_MARGIN);
+
+    // ---- Lives panel: same visual family as the score/high-score
+    // panels, showing a single digit (0-3). Sits just below high score.
+    localparam LIVES_X0 = SCORE_X0;
+    localparam LIVES_Y0 = HI_Y0 + HI_CELL + SCORE_PANEL_MARGIN * 2 + 10'd10; // stacked below the HI panel
+    localparam LIVES_CELL = 10'd32;
+
+    wire [9:0] lives_box_w = LIVES_CELL;
+    wire [9:0] lives_box_h = LIVES_CELL;
+
+    wire in_lives_box = (x >= LIVES_X0) && (x < LIVES_X0 + lives_box_w) &&
+                        (y >= LIVES_Y0) && (y < LIVES_Y0 + lives_box_h);
+
+    wire in_lives_panel = (x >= LIVES_X0 - SCORE_PANEL_MARGIN) && (x < LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN) &&
+                          (y >= LIVES_Y0 - SCORE_PANEL_MARGIN) && (y < LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN);
+
+    wire in_lives_border = in_lives_panel &&
+                           ((x < LIVES_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (x >= LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
+                            (y < LIVES_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (y >= LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
+
+    wire [9:0] lives_xrel = x - LIVES_X0;
+    wire [9:0] lives_yrel = y - LIVES_Y0;
+    wire [2:0] lives_col  = lives_xrel[4:0] >> 2;
+    wire [2:0] lives_row  = lives_yrel[4:0] >> 2;
+
+    wire [4:0] lives_glyph_row = glyph_row({3'd0, lives}, lives_row);
+    wire lives_glyph_bit = in_lives_box && (lives_col < 3'd5) && (lives_row < 3'd7) &&
+                           lives_glyph_row[4 - lives_col];
 
     reg [7:0] terrain_r, terrain_g, terrain_b;
 
@@ -1384,6 +1518,34 @@ localparam CAR_W = 10'd128;
                 red   = 8'd200;
                 green = 8'd220;
                 blue  = 8'd255;   // pale blue high-score digits
+            end
+
+            if (in_lives_panel) begin
+                if (in_lives_border) begin
+                    red   = 8'd255;
+                    green = 8'd120;
+                    blue  = 8'd120;   // soft red border ring for the lives panel
+                end else begin
+                    red   = 8'd18;
+                    green = 8'd16;
+                    blue  = 8'd30;
+                end
+            end
+            if (lives_glyph_bit) begin
+                red   = 8'd255;
+                green = 8'd100;
+                blue  = 8'd100;   // red-ish "lives" digit
+            end
+
+            if (in_st_panel) begin
+                red   = 8'd18;
+                green = 8'd16;
+                blue  = 8'd30;
+            end
+            if (st_glyph_bit) begin
+                red   = 8'd120;
+                green = 8'd255;
+                blue  = 8'd140;   // green "START" text -- distinct from the red GAME OVER
             end
 
             if (go_glyph_bit) begin
