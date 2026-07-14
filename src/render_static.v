@@ -349,6 +349,76 @@ module render_static (
     assign grass_speck_a = x[0] ^ anim_y[0];
     assign grass_speck_b = x[2] ^ anim_y[2];
 
+    // ------------------------------------------------------------------
+    // Grass decorations: flowers, small rocks, and tall-grass clumps.
+    //
+    // Same cheap idea as asphalt_fleck/grass_speck above, just split
+    // into two stages so the "on" regions are small dots/blobs instead
+    // of big 16x16 blocks:
+    //   1. Chop the screen into 16x16 cells (world-space, scrolling
+    //      with anim_y like everything else) and hash each cell's
+    //      coordinates to decide IF that cell gets a decoration.
+    //   2. Use the cell-LOCAL coordinates (the low 4 bits) to place a
+    //      small shape (a dot, a blob, a few blades) within that cell.
+    //
+    // No per-object registers/instances needed -- it's just a handful
+    // of comparisons, same spirit as the fleck/speck technique already
+    // used for asphalt and base grass texture.
+    // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Curve-corrected x for anything that should visually "ride along"
+    // with the bending road (grass decorations here, same idea as how
+    // trees/signs are positioned relative to curved_center_x below) --
+    // without this, the decoration grid stays glued to the screen while
+    // the road/trees swing left and right around it, which looks wrong.
+    // Reuses the exact same curve_shift_at function the road/trees/car/
+    // obstacle all share, so the grass rides along in perfect agreement
+    // with everything else instead of using its own cruder approximation.
+    // ------------------------------------------------------------------
+    wire signed [13:0] row_curve_shift = curve_shift_at(curve_amount, dy);
+    wire signed [14:0] deco_x_signed = $signed({1'b0, x}) - row_curve_shift;
+    wire [9:0] deco_world_x = deco_x_signed[9:0]; // only ever used for hashing, so wraparound at the edges is harmless
+
+    wire [5:0] deco_cx = deco_world_x[9:4];   // which 16px cell, horizontally -- now curve-corrected
+    wire [5:0] deco_cy = anim_y[9:4]; // which 16px cell, vertically (scrolls with the world)
+    wire [3:0] deco_lx = deco_world_x[3:0];   // position within the cell, 0..15 -- also curve-corrected
+    wire [3:0] deco_ly = anim_y[3:0];
+
+    // Cheap scramble so cells don't light up in an obvious diagonal
+    // stripe pattern -- doesn't need to be a "good" hash, just enough
+    // to look scattered rather than gridlike.
+    wire [5:0] deco_hash = deco_cx ^ {deco_cy[2:0], deco_cy[5:3]};
+
+    // Three mostly-disjoint residues of deco_hash so flowers/rocks/tall
+    // grass land in different cells instead of always stacking together.
+    wire flower_cell   = (deco_hash[3:0] == 4'd6);
+    wire rock_cell      = (deco_hash[3:0] == 4'd11);
+    wire tallgrass_cell = (deco_hash[3:0] == 4'd2) || (deco_hash[3:0] == 4'd9);
+
+    // ---- Flowers: a tiny 2x2 dot at the cell center, color varies by
+    // a couple of the hash bits (4 close wildflower tones).
+    wire flower_pixel = flower_cell &&
+                        (deco_lx >= 4'd7) && (deco_lx <= 4'd8) &&
+                        (deco_ly >= 4'd7) && (deco_ly <= 4'd8);
+    wire [1:0] flower_color_sel = deco_hash[5:4];
+
+    // ---- Rocks: small flattened oval (wider than tall, like a
+    // pebble), radius varies slightly (2 or 3px) using one more hash
+    // bit so they're not all identical.
+    wire signed [4:0] rock_dx = $signed({1'b0, deco_lx}) - 5'sd8;
+    wire signed [4:0] rock_dy = $signed({1'b0, deco_ly}) - 5'sd8;
+    wire [2:0] rock_r = deco_hash[5] ? 3'd3 : 3'd2;
+    wire rock_pixel = rock_cell &&
+                      ((rock_dx * rock_dx) + (rock_dy * rock_dy * 5'sd2) <=
+                       ({2'b0, rock_r} * {2'b0, rock_r} * 5'sd2));
+
+    // ---- Tall grass / ilalang: 3 thin vertical blades per clump,
+    // brighter than the base grass so the clump reads as a different
+    // texture instead of just "more grass speckle".
+    wire tallgrass_blade_col = (deco_lx == 4'd4) || (deco_lx == 4'd7) || (deco_lx == 4'd11);
+    wire tallgrass_blade_row = (deco_ly >= 4'd9) && (deco_ly <= 4'd14);
+    wire tallgrass_pixel = tallgrass_cell && tallgrass_blade_col && tallgrass_blade_row;
+
     // Wrap a tree's base y-position (ty) forward by scroll_y, looping
     // back to the horizon once it would scroll past the bottom of the
     // screen. Keeps every tree cycling endlessly down the road instead
@@ -520,6 +590,136 @@ module render_static (
             if (tp_left[ti] == 3'b101 || tp_right[ti] == 3'b101) tree_trunk_shadow   = 1'b1;
         end
     end
+
+    // ------------------------------------------------------------------
+    // Curve warning signs: a yellow diamond with a black arrow, posted
+    // on the right shoulder, that only shows up during the STRAIGHT
+    // phase right before a curve -- warning which way the bend is about
+    // to go before you can see it. Disappears once the curve itself
+    // starts (you're already in it by then, don't need the warning).
+    //
+    // Two instances, staggered like the trees, so more than one is
+    // visible across a straight stretch (real roads repeat these signs
+    // too) -- both share the same direction/visibility logic since
+    // that only depends on the current global `phase`, not on which
+    // instance it is.
+    // ------------------------------------------------------------------
+    localparam SIGN_Y_STEP = TREE_Y_MAX - TREE_Y_MIN; // one full cycle per instance
+    localparam SIGN_BASE_HALF = 10'd7;   // diamond radius at the horizon
+    localparam SIGN_SCALE_SHIFT = 4;      // grows with distance, same idea as trees
+    localparam SIGN_GAP = 10'd10;         // gap from the road edge, a bit further out than trees
+
+    // Only show the sign during the tail end of the straight phase --
+    // i.e. the last stretch of road right before the curve actually
+    // starts -- instead of across the whole straight segment. seg_dist
+    // counts up from 0 to SEGMENT_LENGTH each phase, so "close to the
+    // end of the phase" is seg_dist >= SEGMENT_LENGTH - SIGN_WINDOW.
+    // Tune SIGN_WINDOW to make the warning appear earlier/later.
+    localparam [19:0] SIGN_WINDOW = 20'd220;
+
+    wire sign_upcoming_right = (phase == PHASE_STRAIGHT_1);
+    wire sign_upcoming_left  = (phase == PHASE_STRAIGHT_2);
+    wire sign_timing         = (seg_dist >= (SEGMENT_LENGTH - SIGN_WINDOW));
+    wire sign_visible        = (sign_upcoming_right || sign_upcoming_left) && sign_timing;
+
+    // Function returns 0=nothing, 1=yellow face, 2=black arrow.
+    // Arrow is a simple sideways triangle using the same
+    // similar-triangles proportion trick as the (now-unused) old
+    // procedural mountains: at the base (ddx=0) the allowed |dy| is
+    // the full radius; it tapers linearly to 0 right at the tip
+    // (ddx==2*R), so "2*|dy| + ddx <= 2*R" traces a clean triangle
+    // with no division needed.
+    function [1:0] sign_at;
+        input [9:0] px, py;
+        input [9:0] sx, sy;   // sign center
+        input [4:0] half;      // diamond radius
+        input       dir;        // 0 = arrow points left, 1 = arrow points right
+        reg signed [10:0] ddx, ddy, adx, ady;
+        reg signed [10:0] arrow_r;
+        reg signed [10:0] ddx_tri;
+        begin
+            ddx = $signed({1'b0, px}) - $signed({1'b0, sx});
+            ddy = $signed({1'b0, py}) - $signed({1'b0, sy});
+            adx = ddx[10] ? -ddx : ddx;
+            ady = ddy[10] ? -ddy : ddy;
+
+            arrow_r = $signed({1'b0, half}) >>> 1; // arrow a bit smaller than the diamond itself
+            ddx_tri = dir ? (ddx + arrow_r) : (arrow_r - ddx);
+
+            if ((adx + ady) > $signed({1'b0, half}))
+                sign_at = 2'd0; // outside the diamond entirely
+            else if ((ddx_tri >= 11'sd0) && (ddx_tri <= (arrow_r <<< 1)) &&
+                     ((ady <<< 1) + ddx_tri <= (arrow_r <<< 1)))
+                sign_at = 2'd2; // black arrow
+            else
+                sign_at = 2'd1; // yellow diamond background
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Sign post: a plain vertical pole standing directly under the
+    // diamond, so the sign reads as "planted on the shoulder" instead
+    // of floating. Same cel-shaded lit/shadow split as the tree trunks
+    // (px < sx = lit side), and it scales with `half` so it grows in
+    // step with the diamond as the sign approaches.
+    // Returns: 0 = none, 1 = post lit side, 2 = post shadow side.
+    // ------------------------------------------------------------------
+    function [1:0] post_at;
+        input [9:0] px, py;
+        input [9:0] sx, sy;   // sign center (sy = diamond center row)
+        input [4:0] half;     // diamond radius -- post scales off this
+        reg   [9:0] pw;       // post half-width
+        reg   [9:0] post_top, post_bot;
+        begin
+            pw = {5'd0, half} >> 2;
+            if (pw < 10'd1) pw = 10'd1;
+
+            post_top = sy + {5'd0, half};              // right where the diamond's bottom point sits
+            post_bot = post_top + ({5'd0, half} <<< 1); // extends down twice the diamond radius
+
+            if ((px >= sx - pw) && (px <= sx + pw) &&
+                (py >= post_top) && (py <= post_bot))
+                post_at = (px < sx) ? 2'd1 : 2'd2;
+            else
+                post_at = 2'd0;
+        end
+    endfunction
+
+    wire [1:0] sign_p0, sign_p1;
+
+    // Instance 0
+    wire [9:0] sign0_ty    = wrap_ty(TREE_Y_MIN + (SIGN_Y_STEP >> 2), scroll_y);
+    wire [9:0] sign0_dy    = sign0_ty - TREE_Y_MIN;
+    wire [9:0] sign0_half  = SIGN_BASE_HALF + (sign0_dy >> SIGN_SCALE_SHIFT);
+    wire [9:0] sign0_rhalf = ROAD_HALF_FAR + (sign0_dy >> 1);
+    wire signed [13:0] sign0_cshift = curve_shift_at(curve_amount, sign0_dy);
+    wire signed [13:0] sign0_censig = $signed({1'b0, ROAD_CENTER_X}) + sign0_cshift;
+    wire [9:0] sign0_center = clamp_center_x(sign0_censig, 10'd5);
+    wire [9:0] sign0_sx = sign0_center + sign0_rhalf + SIGN_GAP + sign0_half;
+
+    assign sign_p0 = sign_visible ? sign_at(x, y, sign0_sx, sign0_ty, sign0_half[4:0], sign_upcoming_right) : 2'd0;
+
+    // Instance 1 -- staggered halfway through the cycle
+    wire [9:0] sign1_ty    = wrap_ty(TREE_Y_MIN + (SIGN_Y_STEP >> 2) + (SIGN_Y_STEP >> 1), scroll_y);
+    wire [9:0] sign1_dy    = sign1_ty - TREE_Y_MIN;
+    wire [9:0] sign1_half  = SIGN_BASE_HALF + (sign1_dy >> SIGN_SCALE_SHIFT);
+    wire [9:0] sign1_rhalf = ROAD_HALF_FAR + (sign1_dy >> 1);
+    wire signed [13:0] sign1_cshift = curve_shift_at(curve_amount, sign1_dy);
+    wire signed [13:0] sign1_censig = $signed({1'b0, ROAD_CENTER_X}) + sign1_cshift;
+    wire [9:0] sign1_center = clamp_center_x(sign1_censig, 10'd5);
+    wire [9:0] sign1_sx = sign1_center + sign1_rhalf + SIGN_GAP + sign1_half;
+
+    assign sign_p1 = sign_visible ? sign_at(x, y, sign1_sx, sign1_ty, sign1_half[4:0], sign_upcoming_right) : 2'd0;
+
+    wire sign_face  = (sign_p0 == 2'd1) || (sign_p1 == 2'd1);
+    wire sign_arrow = (sign_p0 == 2'd2) || (sign_p1 == 2'd2);
+
+    wire [1:0] post_p0 = sign_visible ? post_at(x, y, sign0_sx, sign0_ty, sign0_half[4:0]) : 2'd0;
+    wire [1:0] post_p1 = sign_visible ? post_at(x, y, sign1_sx, sign1_ty, sign1_half[4:0]) : 2'd0;
+
+    wire sign_post_lit    = (post_p0 == 2'd1) || (post_p1 == 2'd1);
+    wire sign_post_shadow = (post_p0 == 2'd2) || (post_p1 == 2'd2);
+
 	 // ================= Background ROM =================
 	wire [16:0] bg_addr;
 	wire [11:0] bg_pixel;
@@ -1586,6 +1786,59 @@ localparam CAR_W = 10'd128;
                 terrain_r = 8'd72;
                 terrain_g = 8'd54;
                 terrain_b = 8'd68;
+            end
+
+            else if (sign_arrow) begin
+                // Black arrow on the warning sign.
+                terrain_r = 8'd20;
+                terrain_g = 8'd18;
+                terrain_b = 8'd16;
+            end
+
+            else if (sign_face) begin
+                // Yellow diamond warning-sign background.
+                terrain_r = 8'd235;
+                terrain_g = 8'd190;
+                terrain_b = 8'd40;
+            end
+
+            else if (sign_post_lit) begin
+                // Sign post, lit side -- plain weathered grey wood/metal.
+                terrain_r = 8'd150;
+                terrain_g = 8'd142;
+                terrain_b = 8'd132;
+            end
+
+            else if (sign_post_shadow) begin
+                // Sign post, shadow side.
+                terrain_r = 8'd104;
+                terrain_g = 8'd98;
+                terrain_b = 8'd90;
+            end
+
+            else if (flower_pixel) begin
+                // 4 close wildflower tones -- yellow, pink, white, pale lavender.
+                case (flower_color_sel)
+                    2'b00: begin terrain_r = 8'd240; terrain_g = 8'd210; terrain_b = 8'd90;  end // yellow
+                    2'b01: begin terrain_r = 8'd235; terrain_g = 8'd150; terrain_b = 8'd190; end // pink
+                    2'b10: begin terrain_r = 8'd245; terrain_g = 8'd245; terrain_b = 8'd240; end // white
+                    default: begin terrain_r = 8'd200; terrain_g = 8'd170; terrain_b = 8'd230; end // pale lavender
+                endcase
+            end
+
+            else if (rock_pixel) begin
+                // Cool grey pebble, slightly bluish to match the dusk palette.
+                terrain_r = 8'd120;
+                terrain_g = 8'd118;
+                terrain_b = 8'd128;
+            end
+
+            else if (tallgrass_pixel) begin
+                // Brighter than the base grass shades below, so the
+                // blades pop as a distinct texture rather than blending in.
+                terrain_r = 8'd90;
+                terrain_g = 8'd160;
+                terrain_b = 8'd150;
             end
 
             else begin
