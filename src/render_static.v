@@ -170,12 +170,15 @@ module render_static (
     // sharper CURVE_MAX_CAP than before.
     // ------------------------------------------------------------------
     function [9:0] clamp_center_x;
-        input signed [10:0] cx;
+        input signed [13:0] cx;    // widened from [10:0]: curve_shift_at can now return values
+                                    // past +-1024 with the quadratic curve below, which would
+                                    // silently overflow/wrap an 11-bit signed input before this
+                                    // function even got a chance to clamp it
         input [9:0] half_extent;
-        reg signed [10:0] lo, hi;
+        reg signed [13:0] lo, hi;
         begin
-            lo = $signed({1'b0, half_extent});
-            hi = 11'sd639 - $signed({1'b0, half_extent});
+            lo = $signed({4'd0, half_extent});
+            hi = 14'sd639 - $signed({4'd0, half_extent});
             if (cx < lo)
                 clamp_center_x = lo[9:0];
             else if (cx > hi)
@@ -201,22 +204,35 @@ module render_static (
     // every consumer (road/trees/car/obstacle) stays in perfect
     // agreement with each other.
     // ------------------------------------------------------------------
-    function signed [10:0] curve_shift_at;
+    function signed [13:0] curve_shift_at;
         input signed [6:0] camt;   // curve_amount (or a snapshot of it)
         input        [9:0] dyv;    // distance from horizon for this row/object
-        reg          [9:0] cbase_fine;  // 360 (horizon) .. 0 (bottom of screen)
+        reg          [9:0] d;           // 360 (horizon) .. 0 (bottom of screen)
+        reg          [19:0] d_sq;       // d*d, fits comfortably in 20 bits (max 360*360=129600)
+        reg          [9:0] cbase_fine;  // quadratic falloff of d, NOT linear
         reg signed  [17:0] prod;
         begin
-            cbase_fine     = 10'd360 - dyv;
+            d              = 10'd360 - dyv;
+            // Quadratic instead of linear: a plain "cbase_fine = d"
+            // makes the road's centerline a straight-line ramp in y --
+            // i.e. the road bends like a flat wedge/hinge with sharp,
+            // angular corners at the phase transitions instead of
+            // tracing an actual arc. Squaring d (then rescaling back
+            // down) makes the shift grow slowly near the camera and
+            // sharply out near the horizon, like a real road curving
+            // away into the distance -- a smooth, rounded bend instead
+            // of a perpendicular-looking kink.
+            d_sq           = d * d;
+            cbase_fine     = d_sq >> 8;
             prod           = camt * $signed({1'b0, cbase_fine});
             curve_shift_at = prod >>> 3;   // same overall /8 scale the old code used
         end
     endfunction
 
-    wire signed [10:0] curve_shift;
+    wire signed [13:0] curve_shift;
     assign curve_shift = curve_shift_at(curve_amount, dy);
 
-    wire signed [10:0] center_x_signed;
+    wire signed [13:0] center_x_signed;
     assign center_x_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift;
 
     wire [9:0] curved_center_x;
@@ -456,9 +472,9 @@ module render_static (
             wire [9:0] this_half  = TREE_BASE_HALF + (this_dy >> TREE_SCALE_SHIFT);
             wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
 
-            wire signed [10:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
-            wire signed [10:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
-            wire [9:0] this_center = this_censig[9:0];
+            wire signed [13:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5); // just prevents bit-overflow wrap, trees can still sit near the edge
 
             wire [9:0] this_tx = this_center - this_rhalf - TREE_GAP - this_half;
 
@@ -474,9 +490,9 @@ module render_static (
             wire [9:0] this_half  = TREE_BASE_HALF + (this_dy >> TREE_SCALE_SHIFT);
             wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
 
-            wire signed [10:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
-            wire signed [10:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
-            wire [9:0] this_center = this_censig[9:0];
+            wire signed [13:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5); // just prevents bit-overflow wrap, trees can still sit near the edge
 
             wire [9:0] this_tx = this_center + this_rhalf + TREE_GAP + this_half;
 
@@ -660,10 +676,10 @@ localparam CAR_W = 10'd128;
     // dan rintangan di atas.
     // ------------------------------------------------------------------
     wire [9:0] dy_car         = (CAR_Y + CAR_HITBOX_MARGIN_TOP) - 10'd120;
-    wire signed [10:0] curve_shift_car     = curve_shift_at(curve_amount, dy_car);
-    wire signed [10:0] center_x_car_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_car;
-    wire [9:0] curved_center_x_car = center_x_car_signed[9:0];
+    wire signed [13:0] curve_shift_car     = curve_shift_at(curve_amount, dy_car);
+    wire signed [13:0] center_x_car_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_car;
     wire [9:0] road_half_car  = ROAD_HALF_FAR + (dy_car >> 1);
+    wire [9:0] curved_center_x_car = clamp_center_x(center_x_car_signed, road_half_car);
     wire [9:0] road_left_car  = curved_center_x_car - road_half_car;
     wire [9:0] road_right_car = curved_center_x_car + road_half_car;
 
@@ -782,9 +798,9 @@ localparam CAR_W = 10'd128;
     localparam OBS_Y_END        = CAR_Y + CAR_H;     // once it reaches here it has "passed" the player
     // Diperkecil sedikit dari sebelumnya (6/6, shift 3) supaya rintangan
     // tidak terlalu besar/menakutkan dan tumbuh lebih halus saat mendekat.
-    localparam OBS_BASE_HALF_W  = 10'd3;   // half-width at the horizon (small/far away)
-    localparam OBS_BASE_HALF_H  = 10'd3;   // half-height at the horizon
-    localparam OBS_SCALE_SHIFT  = 5;       // how fast it grows with distance (smaller = grows faster)
+    localparam OBS_BASE_HALF_W  = 10'd4;   // half-width at the horizon (small/far away)
+    localparam OBS_BASE_HALF_H  = 10'd4;   // half-height at the horizon
+    localparam OBS_SCALE_SHIFT  = 4;       // how fast it grows with distance (smaller = grows faster)
 
     // ------------------------------------------------------------------
     // Difficulty scaling: obstacles approach faster as the score goes
@@ -874,8 +890,8 @@ localparam CAR_W = 10'd128;
     // (dy_obs) instead of the current scanline's dy -- it's a flat box,
     // so one size/position per frame is enough, no per-row recompute.
     wire [9:0] dy_obs         = obstacle_y - 10'd120;
-    wire signed [10:0] curve_shift_obs = curve_shift_at(curve_amount, dy_obs);
-    wire signed [10:0] center_x_obs_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_obs;
+    wire signed [13:0] curve_shift_obs = curve_shift_at(curve_amount, dy_obs);
+    wire signed [13:0] center_x_obs_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_obs;
     wire [9:0] road_half_obs  = ROAD_HALF_FAR + (dy_obs >> 1);
 
     // Lane offset as a fraction of the road's current half-width at
