@@ -78,9 +78,14 @@ module render_static (
     // Road curve: bend the top of the road sideways while the bottom
     // stays anchored at ROAD_CENTER_X.
     //
-    // curve_base runs from 45 at the horizon (dy=0) down to 0 at the
-    // very bottom of the screen (dy=360, i.e. y=480) -- dy>>3 is just
-    // dy/8, and 360/8=45, so it lands on exactly 0 with no division.
+    // The sideways bend at any distance is curve_amount * (360 - dy),
+    // scaled down by /8 at the very end (see curve_shift_at below) --
+    // so it runs from a full 45x factor at the horizon (dy=0) down to
+    // 0 at the very bottom of the screen (dy=360, i.e. y=480), same
+    // range as before. Keeping dy un-truncated until the final divide
+    // (instead of a coarse dy>>3 done up front) is what makes the
+    // curve trace one smooth arc per scanline instead of a visible
+    // 8-row "staircase" on sharper bends.
     //
     // This is fully automatic and cycles through 4 phases, each lasting
     // SEGMENT_LENGTH pixels of travel: straight -> curve right ->
@@ -88,11 +93,15 @@ module render_static (
     // whatever the current phase's target is by CURVE_STEP per frame,
     // so transitions are smooth instead of an instant kink.
     // ------------------------------------------------------------------
-    // CURVE_MAX_CAP=6 is the safe ceiling: past this, curved_center_x
-    // would push road_left below 0 at the horizon, which underflows the
-    // unsigned subtraction and makes the road glitch/wrap on screen.
-    localparam signed CURVE_MAX_CAP       = 6;
-    localparam signed CURVE_MAX_START     = 1;   // how sharp the very first bend is
+    // CURVE_MAX_CAP was previously limited to 6 because curved_center_x
+    // (and the obstacle version of the same math) used to truncate
+    // straight to unsigned with no bounds check, which would underflow
+    // and glitch/wrap the road near the horizon past that point. Both
+    // now go through clamp_center_x (below) before being used, so
+    // pushing this much higher is safe -- the road just visually pins
+    // at its max bend instead of wrapping.
+    localparam signed CURVE_MAX_CAP       = 16;
+    localparam signed CURVE_MAX_START     = 3;   // how sharp the very first bend is
     localparam signed CURVE_MAX_INCREMENT = 1;   // how much sharper each new loop gets
     localparam         CURVE_STEP    = 1;      // how much curve_amount moves each time it updates
     localparam         CURVE_UPDATE_DIVIDER = 8'd4; // only step every N frames -- bigger = slower/smoother easing
@@ -105,23 +114,21 @@ module render_static (
 
     reg [19:0]        seg_dist;
     reg [1:0]         phase;         // cycles 0 -> 1 -> 2 -> 3 -> 0 ...
-    reg signed [4:0]  curve_amount;  // -current_curve_max .. +current_curve_max
+    reg signed [6:0]  curve_amount;  // -current_curve_max .. +current_curve_max
     reg [7:0]         curve_update_counter;
-    reg signed [4:0]  current_curve_max;  // grows by CURVE_MAX_INCREMENT each full loop, capped at CURVE_MAX_CAP
+    reg signed [6:0]  current_curve_max;  // grows by CURVE_MAX_INCREMENT each full loop, capped at CURVE_MAX_CAP
 
     initial current_curve_max = CURVE_MAX_START;
 
-    wire signed [4:0] target_curve = (phase == PHASE_RIGHT) ? current_curve_max :
+    wire signed [6:0] target_curve = (phase == PHASE_RIGHT) ? current_curve_max :
                                       (phase == PHASE_LEFT)  ? -current_curve_max :
-                                                                5'sd0;
-
-    wire [9:0] curve_base = 10'd45 - (dy >> 3);
+                                                                7'sd0;
 
     always @(posedge clk) begin
         if (reset) begin
             seg_dist             <= 20'd0;
             phase                <= PHASE_STRAIGHT_1;
-            curve_amount         <= 5'sd0;
+            curve_amount         <= 7'sd0;
             curve_update_counter <= 8'd0;
             current_curve_max    <= CURVE_MAX_START;
         end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin   // once per frame, freeze on game over / before start
@@ -151,14 +158,69 @@ module render_static (
         end
     end
 
+    // ------------------------------------------------------------------
+    // Clamps a curved center-x to whatever range keeps a box of the
+    // given half-extent fully on screen (0..639). Used for the road
+    // itself and for the obstacle, which does the same "bend sideways
+    // by curve_amount" math at its own distance -- without this, a
+    // strong enough curve_amount pushes the raw signed value negative
+    // (or past 639), and truncating that straight to unsigned wraps
+    // around instead of clamping, which glitches the road/obstacle
+    // right at the horizon. This is what makes it safe to allow a much
+    // sharper CURVE_MAX_CAP than before.
+    // ------------------------------------------------------------------
+    function [9:0] clamp_center_x;
+        input signed [10:0] cx;
+        input [9:0] half_extent;
+        reg signed [10:0] lo, hi;
+        begin
+            lo = $signed({1'b0, half_extent});
+            hi = 11'sd639 - $signed({1'b0, half_extent});
+            if (cx < lo)
+                clamp_center_x = lo[9:0];
+            else if (cx > hi)
+                clamp_center_x = hi[9:0];
+            else
+                clamp_center_x = cx[9:0];
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Shared, full-resolution curve math used by every element that
+    // needs "how far sideways is the road bent at this distance" --
+    // the road surface itself, both treelines, the car's dynamic road
+    // limits, and the obstacle all called this same formula
+    // independently before, each with its own coarse `45 - (dy >> 3)`
+    // pre-truncation. That truncation only changes once every 8 rows,
+    // which is harmless for a single-row check (car/obstacle) but for
+    // the road surface -- evaluated on every scanline -- it made the
+    // curve edge visibly step in 8px "stairs" instead of tracing one
+    // smooth arc, especially on sharper bends. Folding the divide-by-8
+    // into the END of the calculation instead keeps full per-row
+    // precision the whole way through, so the curve is smooth AND
+    // every consumer (road/trees/car/obstacle) stays in perfect
+    // agreement with each other.
+    // ------------------------------------------------------------------
+    function signed [10:0] curve_shift_at;
+        input signed [6:0] camt;   // curve_amount (or a snapshot of it)
+        input        [9:0] dyv;    // distance from horizon for this row/object
+        reg          [9:0] cbase_fine;  // 360 (horizon) .. 0 (bottom of screen)
+        reg signed  [17:0] prod;
+        begin
+            cbase_fine     = 10'd360 - dyv;
+            prod           = camt * $signed({1'b0, cbase_fine});
+            curve_shift_at = prod >>> 3;   // same overall /8 scale the old code used
+        end
+    endfunction
+
     wire signed [10:0] curve_shift;
-    assign curve_shift = curve_amount * $signed({1'b0, curve_base});
+    assign curve_shift = curve_shift_at(curve_amount, dy);
 
     wire signed [10:0] center_x_signed;
     assign center_x_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift;
 
     wire [9:0] curved_center_x;
-    assign curved_center_x = center_x_signed[9:0];
+    assign curved_center_x = clamp_center_x(center_x_signed, ROAD_HALF_FAR + (dy >> 1));
 
     assign road_left  = curved_center_x - (ROAD_HALF_FAR + (dy >> 1));
     assign road_right = curved_center_x + (ROAD_HALF_FAR + (dy >> 1));
@@ -281,10 +343,31 @@ module render_static (
         localparam [9:0] Y_MIN  = 10'd120;          // horizon, top of road
         localparam [9:0] Y_MAX  = 10'd480;          // bottom of screen
         localparam [9:0] RANGE  = Y_MAX - Y_MIN;     // 360
-        reg [9:0] offset;
+        reg [10:0] offset;   // 11 bits: max (ty-Y_MIN)+scroll = 360+1023 = 1383, needs >10 bits
         begin
-            offset  = (ty - Y_MIN + scroll) % RANGE;
-            wrap_ty = Y_MIN + offset;
+            // ------------------------------------------------------------
+            // BUG FIX: this used to be `(ty - Y_MIN + scroll) % RANGE`.
+            // RANGE (360) is NOT a power of 2, so Quartus can't turn that
+            // % into a free bit-slice -- it has to synthesize a full
+            // division circuit. This function is called 16 times (8 left
+            // trees + 8 right trees), so that was 16 separate dividers,
+            // which is exactly the kind of thing that makes Analysis &
+            // Synthesis balloon in memory/time and crash Quartus on a
+            // machine with limited RAM.
+            //
+            // Since the value being wrapped ((ty - Y_MIN) + scroll) can
+            // only ever reach 360 + 1023 = 1383 at most, "mod 360" here
+            // is exactly the same as subtracting 360 repeatedly until
+            // what's left is under 360 -- at most 4 subtractions ever
+            // needed. Each subtraction is just a comparator + subtractor,
+            // orders of magnitude cheaper to synthesize than a divider.
+            // ------------------------------------------------------------
+            offset = {1'b0, ty} - {1'b0, Y_MIN} + {1'b0, scroll};
+            if (offset >= {1'b0, RANGE}) offset = offset - {1'b0, RANGE};
+            if (offset >= {1'b0, RANGE}) offset = offset - {1'b0, RANGE};
+            if (offset >= {1'b0, RANGE}) offset = offset - {1'b0, RANGE};
+            if (offset >= {1'b0, RANGE}) offset = offset - {1'b0, RANGE};
+            wrap_ty = Y_MIN + offset[9:0];
         end
     endfunction
 
@@ -373,8 +456,7 @@ module render_static (
             wire [9:0] this_half  = TREE_BASE_HALF + (this_dy >> TREE_SCALE_SHIFT);
             wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
 
-            wire [9:0] this_cbase = 10'd45 - (this_dy >> 3);
-            wire signed [10:0] this_cshift  = curve_amount * $signed({1'b0, this_cbase});
+            wire signed [10:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
             wire signed [10:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
             wire [9:0] this_center = this_censig[9:0];
 
@@ -392,8 +474,7 @@ module render_static (
             wire [9:0] this_half  = TREE_BASE_HALF + (this_dy >> TREE_SCALE_SHIFT);
             wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
 
-            wire [9:0] this_cbase = 10'd45 - (this_dy >> 3);
-            wire signed [10:0] this_cshift  = curve_amount * $signed({1'b0, this_cbase});
+            wire signed [10:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
             wire signed [10:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
             wire [9:0] this_center = this_censig[9:0];
 
@@ -579,8 +660,7 @@ localparam CAR_W = 10'd128;
     // dan rintangan di atas.
     // ------------------------------------------------------------------
     wire [9:0] dy_car         = (CAR_Y + CAR_HITBOX_MARGIN_TOP) - 10'd120;
-    wire [9:0] curve_base_car = 10'd45 - (dy_car >> 3);
-    wire signed [10:0] curve_shift_car     = curve_amount * $signed({1'b0, curve_base_car});
+    wire signed [10:0] curve_shift_car     = curve_shift_at(curve_amount, dy_car);
     wire signed [10:0] center_x_car_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_car;
     wire [9:0] curved_center_x_car = center_x_car_signed[9:0];
     wire [9:0] road_half_car  = ROAD_HALF_FAR + (dy_car >> 1);
@@ -599,28 +679,59 @@ localparam CAR_W = 10'd128;
     wire signed [10:0] car_offset_min_eff = (offset_min_road > CAR_OFFSET_MIN) ? offset_min_road : CAR_OFFSET_MIN;
     wire signed [10:0] car_offset_max_eff = (offset_max_road < CAR_OFFSET_MAX) ? offset_max_road : CAR_OFFSET_MAX;
 
+    // ------------------------------------------------------------------
+    // BUG FIX: on a sharp curve, road_left_car and road_right_car both
+    // shift sideways together, which can squeeze the gap between
+    // car_offset_min_eff and car_offset_max_eff down to less than the
+    // car's own hitbox width -- sometimes even to a single point. When
+    // that happens the car gets pinned wherever the clamp lands, and
+    // that pinned spot can still overlap an obstacle lane, so the
+    // player gets hit even though the obstacle still looks "far away"
+    // on screen: the real problem is there was never enough room left
+    // to steer out of the way in time, not that the collision box is
+    // wrong.
+    //
+    // Fix: if the clamped window is narrower than MIN_DRIVABLE_WIDTH,
+    // re-center a window of at least that width around the same
+    // midpoint, still bounded by the absolute screen limits
+    // (CAR_OFFSET_MIN/MAX) so the car can never be pushed off-screen.
+    // ------------------------------------------------------------------
+    localparam signed [10:0] MIN_DRIVABLE_WIDTH = 11'sd170; // car hitbox (104px) + real dodge room
+
+    wire signed [10:0] eff_width = car_offset_max_eff - car_offset_min_eff;
+    wire signed [10:0] eff_mid   = (car_offset_max_eff + car_offset_min_eff) >>> 1;
+
+    wire signed [10:0] widened_min_raw = eff_mid - (MIN_DRIVABLE_WIDTH >>> 1);
+    wire signed [10:0] widened_max_raw = eff_mid + (MIN_DRIVABLE_WIDTH >>> 1);
+
+    wire signed [10:0] widened_min = (widened_min_raw < CAR_OFFSET_MIN) ? CAR_OFFSET_MIN : widened_min_raw;
+    wire signed [10:0] widened_max = (widened_max_raw > CAR_OFFSET_MAX) ? CAR_OFFSET_MAX : widened_max_raw;
+
+    wire signed [10:0] car_offset_min_final = (eff_width < MIN_DRIVABLE_WIDTH) ? widened_min : car_offset_min_eff;
+    wire signed [10:0] car_offset_max_final = (eff_width < MIN_DRIVABLE_WIDTH) ? widened_max : car_offset_max_eff;
+
     always @(posedge clk) begin
         if (reset) begin
             car_offset <= 11'sd0;
         end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin   // sekali per frame
             if (steer_left && !steer_right) begin
-                if ((car_offset - CAR_STEP) < car_offset_min_eff)
-                    car_offset <= car_offset_min_eff;
+                if ((car_offset - CAR_STEP) < car_offset_min_final)
+                    car_offset <= car_offset_min_final;
                 else
                     car_offset <= car_offset - CAR_STEP;
             end else if (steer_right && !steer_left) begin
-                if ((car_offset + CAR_STEP) > car_offset_max_eff)
-                    car_offset <= car_offset_max_eff;
+                if ((car_offset + CAR_STEP) > car_offset_max_final)
+                    car_offset <= car_offset_max_final;
                 else
                     car_offset <= car_offset + CAR_STEP;
             end else begin
                 // Tidak ada tombol ditahan -> diam di tempat, tapi tetap
                 // dijepit ulang kalau-kalau lengkungan jalan baru saja
                 // menyempit di bawah posisi mobil yang sedang diam.
-                if (car_offset < car_offset_min_eff)
-                    car_offset <= car_offset_min_eff;
-                else if (car_offset > car_offset_max_eff)
-                    car_offset <= car_offset_max_eff;
+                if (car_offset < car_offset_min_final)
+                    car_offset <= car_offset_min_final;
+                else if (car_offset > car_offset_max_final)
+                    car_offset <= car_offset_max_final;
             end
         end
     end
@@ -671,9 +782,9 @@ localparam CAR_W = 10'd128;
     localparam OBS_Y_END        = CAR_Y + CAR_H;     // once it reaches here it has "passed" the player
     // Diperkecil sedikit dari sebelumnya (6/6, shift 3) supaya rintangan
     // tidak terlalu besar/menakutkan dan tumbuh lebih halus saat mendekat.
-    localparam OBS_BASE_HALF_W  = 10'd4;   // half-width at the horizon (small/far away)
-    localparam OBS_BASE_HALF_H  = 10'd4;   // half-height at the horizon
-    localparam OBS_SCALE_SHIFT  = 4;       // how fast it grows with distance (smaller = grows faster)
+    localparam OBS_BASE_HALF_W  = 10'd3;   // half-width at the horizon (small/far away)
+    localparam OBS_BASE_HALF_H  = 10'd3;   // half-height at the horizon
+    localparam OBS_SCALE_SHIFT  = 5;       // how fast it grows with distance (smaller = grows faster)
 
     // ------------------------------------------------------------------
     // Difficulty scaling: obstacles approach faster as the score goes
@@ -684,9 +795,25 @@ localparam CAR_W = 10'd128;
     localparam [15:0] OBSTACLE_SPEEDUP_SCORE   = 16'd50; // score points needed per speed-up step
     localparam [9:0]  OBSTACLE_SPEED_MAX_BONUS = 10'd7;  // hard cap on how much speed can be added
 
-    wire [15:0] speed_tier_raw = score / OBSTACLE_SPEEDUP_SCORE;
-    wire [9:0]  obstacle_speed_bonus = (speed_tier_raw > {6'd0, OBSTACLE_SPEED_MAX_BONUS}) ?
-                                        OBSTACLE_SPEED_MAX_BONUS : speed_tier_raw[9:0];
+    // ------------------------------------------------------------------
+    // BUG FIX: this used to be `score / OBSTACLE_SPEEDUP_SCORE`, a plain
+    // 16-bit / 50 divide. 50 isn't a power of 2 either, so that's a full
+    // divider circuit synthesized in hardware -- another contributor to
+    // the same Analysis & Synthesis blow-up as wrap_ty's old `%` above.
+    // Since the result is capped at just OBSTACLE_SPEED_MAX_BONUS (7)
+    // tiers, we only ever care whether score has crossed 7 fixed
+    // thresholds (50, 100, 150, ... 350) -- a chain of plain comparators
+    // gives the exact same answer for a fraction of the synthesis cost.
+    // ------------------------------------------------------------------
+    wire [9:0] obstacle_speed_bonus =
+        (score >= 16'd350) ? 10'd7 :
+        (score >= 16'd300) ? 10'd6 :
+        (score >= 16'd250) ? 10'd5 :
+        (score >= 16'd200) ? 10'd4 :
+        (score >= 16'd150) ? 10'd3 :
+        (score >= 16'd100) ? 10'd2 :
+        (score >= 16'd50)  ? 10'd1 :
+                              10'd0;
     wire [9:0] OBSTACLE_SPEED = world_scroll_speed; // same rate the road/trees now scroll at, so everything speeds up together
 
     // CAR_STEP naik pakai bonus YANG SAMA persis dengan OBSTACLE_SPEED
@@ -747,8 +874,7 @@ localparam CAR_W = 10'd128;
     // (dy_obs) instead of the current scanline's dy -- it's a flat box,
     // so one size/position per frame is enough, no per-row recompute.
     wire [9:0] dy_obs         = obstacle_y - 10'd120;
-    wire [9:0] curve_base_obs = 10'd45 - (dy_obs >> 3);
-    wire signed [10:0] curve_shift_obs = curve_amount * $signed({1'b0, curve_base_obs});
+    wire signed [10:0] curve_shift_obs = curve_shift_at(curve_amount, dy_obs);
     wire signed [10:0] center_x_obs_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_obs;
     wire [9:0] road_half_obs  = ROAD_HALF_FAR + (dy_obs >> 1);
 
@@ -760,7 +886,7 @@ localparam CAR_W = 10'd128;
                                                                   11'sd0;
 
     wire signed [10:0] obstacle_x_signed = center_x_obs_signed + lane_offset;
-    wire [9:0] obstacle_x = obstacle_x_signed[9:0];
+    wire [9:0] obstacle_x = clamp_center_x(obstacle_x_signed, 10'd25); // 25 > OBS_MAX_HALF_W, safe margin
 
     wire [9:0] obs_half_w = OBS_BASE_HALF_W + (dy_obs >> OBS_SCALE_SHIFT);
     wire [9:0] obs_half_h = OBS_BASE_HALF_H + (dy_obs >> OBS_SCALE_SHIFT);
