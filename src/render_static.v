@@ -305,6 +305,13 @@ module render_static (
     localparam SHOULDER_WIDTH = 6;
     wire shoulder_left, shoulder_right;
 
+    // Trotoar (sidewalk curb): a thin black-and-white striped band
+    // sitting right at the road's edge, between the asphalt and the
+    // dirt shoulder -- like the painted kerb stones on a real road.
+    // Sits INSIDE (closer to the road than) the gravel shoulder below.
+    localparam TROTOAR_WIDTH = 10'd6;
+    wire trotoar_left, trotoar_right;
+
     // A touch of texture on the asphalt itself so it doesn't look like
     // a single flat painted block. Cheap and synthesizable: just XOR a
     // handful of position bits together to get a fixed speckle pattern.
@@ -512,6 +519,70 @@ module render_static (
     endfunction
 
     // ------------------------------------------------------------------
+    // Houses: small procedural buildings (rectangular wall + triangular
+    // roof + a door + two windows) scattered further back in the grass,
+    // behind the treeline, so the roadside doesn't look empty/sepi.
+    // Same function-based approach as tree_at above: one call per
+    // instance, cel-shaded with the same fixed "light from the left"
+    // split used everywhere else (car, trees, signs).
+    //
+    // The roof silhouette reuses the exact cross-multiplication trick
+    // already used for the background mountains and the sign arrow
+    // (dx*height <= half_width*height_from_apex) so no division is
+    // needed to test whether a pixel is inside the sloped roof.
+    //
+    // Returns: 3'b001 = wall lit, 3'b010 = wall shadow, 3'b011 = roof,
+    //          3'b100 = window, 3'b101 = door, 3'b000 = none
+    // ------------------------------------------------------------------
+    function [2:0] house_at;
+        input [9:0] px, py;    // pixel under test
+        input [9:0] hx, hy;    // house position: x center, y = ground/base
+        input [4:0] hw;        // wall half-width
+        input [4:0] hh;        // wall height
+        input [4:0] rh;        // roof height (rise)
+        input [4:0] rhw;       // roof half-width (overhang, >= hw)
+        reg   [9:0] roof_base_y, apex_y;
+        reg   [9:0] dx, dy_from_apex;
+        reg         is_lit;
+        reg   [9:0] door_hw, door_top;
+        reg   [9:0] win_off, win_half, win_top, win_bot;
+        begin
+            roof_base_y = hy - {5'd0, hh};
+            apex_y      = roof_base_y - {5'd0, rh};
+            dx          = (px >= hx) ? (px - hx) : (hx - px);
+            is_lit      = (px < hx);
+
+            door_hw  = {6'd0, hw} >> 2;
+            if (door_hw < 10'd2) door_hw = 10'd2;
+            door_top = hy - ({6'd0, hh} >> 1);
+
+            win_half = {6'd0, hw} >> 3;
+            if (win_half < 10'd1) win_half = 10'd1;
+            win_off  = {6'd0, hw} >> 1;
+            win_top  = roof_base_y + ({6'd0, hh} >> 3) + 10'd1;
+            win_bot  = win_top + (win_half << 1);
+
+            if ((py >= apex_y) && (py < roof_base_y) && (dx <= {5'd0, rhw})) begin
+                dy_from_apex = py - apex_y;
+                if ((dx * {5'd0, rh}) <= ({5'd0, rhw} * dy_from_apex))
+                    house_at = 3'b011; // roof
+                else
+                    house_at = 3'b000;
+            end else if ((py >= roof_base_y) && (py <= hy) && (dx <= {5'd0, hw})) begin
+                if ((dx <= door_hw) && (py >= door_top))
+                    house_at = 3'b101; // door
+                else if ((py >= win_top) && (py <= win_bot) &&
+                         (((dx >= win_off - win_half - win_half) && (dx <= win_off - win_half)) ||
+                          ((dx >= win_half) && (dx <= win_half + win_half))))
+                    house_at = 3'b100; // window (one pane each side of center)
+                else
+                    house_at = is_lit ? 3'b001 : 3'b010; // wall lit/shadow
+            end else
+                house_at = 3'b000;
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
     // Treeline: instead of a handful of trees at fixed spots, generate
     // NUM_TREES_SIDE evenly-spaced trees per side that each cycle
     // through the FULL horizon-to-camera range (via wrap_ty), scale up
@@ -592,133 +663,234 @@ module render_static (
     end
 
     // ------------------------------------------------------------------
-    // Curve warning signs: a yellow diamond with a black arrow, posted
-    // on the right shoulder, that only shows up during the STRAIGHT
-    // phase right before a curve -- warning which way the bend is about
-    // to go before you can see it. Disappears once the curve itself
-    // starts (you're already in it by then, don't need the warning).
+    // Windmill: a tall thin tower with 4 blades spinning around a hub
+    // at the top. The blades toggle between a "+" and an "x" orientation
+    // (windmill_spin, stepped slowly below) -- a cheap two-frame flip
+    // animation that reads as rotation without needing any real angle
+    // math. Same fixed "light from the left" cel-shading on the tower
+    // as every other silhouette in the scene.
     //
-    // Two instances, staggered like the trees, so more than one is
-    // visible across a straight stretch (real roads repeat these signs
-    // too) -- both share the same direction/visibility logic since
-    // that only depends on the current global `phase`, not on which
-    // instance it is.
+    // Returns: 3'b001 = tower lit, 3'b010 = tower shadow,
+    //          3'b011 = blade, 3'b100 = hub, 3'b000 = none
     // ------------------------------------------------------------------
-    localparam SIGN_Y_STEP = TREE_Y_MAX - TREE_Y_MIN; // one full cycle per instance
-    localparam SIGN_BASE_HALF = 10'd7;   // diamond radius at the horizon
-    localparam SIGN_SCALE_SHIFT = 4;      // grows with distance, same idea as trees
-    localparam SIGN_GAP = 10'd10;         // gap from the road edge, a bit further out than trees
+    function [2:0] windmill_at;
+        input [9:0] px, py;
+        input [9:0] wx, wy;   // wx = tower center x, wy = ground/base y
+        input [4:0] tw;       // tower half-width
+        input [4:0] th;       // tower height
+        input [4:0] bl;       // blade half-length (spike length)
+        input       spin;     // 0 = "+" orientation, 1 = "x" orientation
+        reg   [9:0] hub_y;
+        reg signed [10:0] ddx, ddy, sum_s, diff_s;
+        reg   [10:0] adx, ady, asum, adiff;
+        reg   [4:0]  thick;
+        reg          is_lit, plus_blade, x_blade, hub_pixel;
+        begin
+            hub_y  = wy - {5'd0, th};
+            is_lit = (px < wx);
+            thick  = (bl >> 2);
+            if (thick < 5'd1) thick = 5'd1;
 
-    // Only show the sign during the tail end of the straight phase --
-    // i.e. the last stretch of road right before the curve actually
-    // starts -- instead of across the whole straight segment. seg_dist
-    // counts up from 0 to SEGMENT_LENGTH each phase, so "close to the
-    // end of the phase" is seg_dist >= SEGMENT_LENGTH - SIGN_WINDOW.
-    // Tune SIGN_WINDOW to make the warning appear earlier/later.
+            if ((px >= wx - {5'd0, tw}) && (px <= wx + {5'd0, tw}) && (py >= hub_y) && (py <= wy)) begin
+                windmill_at = is_lit ? 3'b001 : 3'b010; // tower lit/shadow
+            end else begin
+                ddx = $signed({1'b0, px}) - $signed({1'b0, wx});
+                ddy = $signed({1'b0, py}) - $signed({1'b0, hub_y});
+                adx = ddx[10] ? (-ddx) : ddx;
+                ady = ddy[10] ? (-ddy) : ddy;
+
+                sum_s  = ddx + ddy;
+                diff_s = ddx - ddy;
+                asum   = sum_s[10]  ? (-sum_s)  : sum_s;
+                adiff  = diff_s[10] ? (-diff_s) : diff_s;
+
+                plus_blade = ((adx <= {6'd0, thick}) && (ady <= {6'd0, bl})) ||
+                             ((ady <= {6'd0, thick}) && (adx <= {6'd0, bl}));
+                x_blade    = ((adiff <= ({6'd0, thick} <<< 1)) && (adx <= {6'd0, bl}) && (ady <= {6'd0, bl})) ||
+                             ((asum  <= ({6'd0, thick} <<< 1)) && (adx <= {6'd0, bl}) && (ady <= {6'd0, bl}));
+                hub_pixel  = (adx <= {6'd0, thick}) && (ady <= {6'd0, thick});
+
+                if (hub_pixel)
+                    windmill_at = 3'b100;
+                else if (spin ? x_blade : plus_blade)
+                    windmill_at = 3'b011;
+                else
+                    windmill_at = 3'b000;
+            end
+        end
+    endfunction
+
+    // Slow "does it spin now" toggle -- steps once every WINDMILL_SPIN_
+    // PERIOD frames, same "step counter" idiom used everywhere else in
+    // this file, so the blade flip is a fixed cadence independent of
+    // the difficulty-linked world_scroll_speed.
+    localparam [7:0] WINDMILL_SPIN_PERIOD = 8'd24;
+    reg windmill_spin;
+    reg [7:0] windmill_spin_counter;
+    initial windmill_spin         = 1'b0;
+    initial windmill_spin_counter = 8'd0;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            windmill_spin         <= 1'b0;
+            windmill_spin_counter <= 8'd0;
+        end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin
+            if (windmill_spin_counter >= WINDMILL_SPIN_PERIOD - 8'd1) begin
+                windmill_spin_counter <= 8'd0;
+                windmill_spin         <= ~windmill_spin;
+            end else begin
+                windmill_spin_counter <= windmill_spin_counter + 8'd1;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Village scenery: houses AND windmills scattered along both sides
+    // of the road, further back than the treeline. Unlike the evenly-
+    // spaced treeline, each of the NUM_SCENERY_SIDE slots per side picks
+    // its own content (house / windmill / empty gap), along-road phase
+    // offset, and depth-from-road offset from a small pseudo-random hash
+    // of its own slot index -- computed entirely at elaboration time
+    // (gi is a genvar, so every "random" value below is just a distinct
+    // compile-time constant per instance, at zero runtime hardware
+    // cost). That's what keeps this from reading as a straight, evenly
+    // spaced "wall" of buildings: some slots sit closer, some further,
+    // some are houses, some are windmills, some are left empty as
+    // breathing room. Distance-scaling and curve-following reuse the
+    // exact same wrap_ty/curve_shift_at math as the treeline, so the
+    // whole village still bends smoothly with the road and keeps
+    // scrolling forever.
+    // ------------------------------------------------------------------
+    localparam NUM_SCENERY_SIDE        = 9;
+    localparam [9:0] SCEN_Y_STEP       = (TREE_Y_MAX - TREE_Y_MIN) / NUM_SCENERY_SIDE; // 40
+    localparam [9:0] SCEN_RIGHT_OFF    = SCEN_Y_STEP >> 1; // stagger right side vs left
+    localparam [9:0] SCEN_BASE_GAP     = 10'd22; // baseline extra gap beyond the treeline
+    localparam [9:0] HOUSE_BASE_HALF   = 10'd6;  // wall half-width at the horizon (small/far away)
+    localparam       HOUSE_SCALE_SHIFT = 4;
+    localparam [9:0] WINDMILL_BASE_HALF   = 10'd3; // tower half-width at the horizon
+    localparam       WINDMILL_SCALE_SHIFT = 4;
+
+    wire [2:0] hp_left  [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] hp_right [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] wp_left  [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] wp_right [0:NUM_SCENERY_SIDE-1];
+
+    generate
+        for (gi = 0; gi < NUM_SCENERY_SIDE; gi = gi + 1) begin : gen_left_scenery
+            // Elaboration-time pseudo-random hash of this slot's index --
+            // just an LCG-flavored constant expression, unique per gi.
+            localparam [15:0] SEED       = (gi * 16'd40503) + 16'd18041;
+            localparam [2:0]  TYPE_SEL   = SEED[2:0];   // 0-3 house, 4/5/7 windmill, 6 empty
+            localparam [9:0]  PHASE_JIT  = {6'd0, SEED[6:3]};   // 0..15 px along-road jitter
+            localparam [9:0]  GAP_JIT    = {7'd0, SEED[9:7]} << 2; // 0..28 px depth jitter
+            localparam        IS_HOUSE   = (TYPE_SEL <= 3'd3);
+            localparam        IS_WINDMILL = (TYPE_SEL == 3'd4) || (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
+
+            localparam [9:0] base_sy = TREE_Y_MIN + (SCEN_Y_STEP >> 1) + gi * SCEN_Y_STEP + PHASE_JIT;
+
+            wire [9:0] this_sy    = wrap_ty(base_sy, scroll_y);
+            wire [9:0] this_dy    = this_sy - TREE_Y_MIN;
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_house_half = HOUSE_BASE_HALF    + (this_dy >> HOUSE_SCALE_SHIFT);
+            wire [9:0] this_wind_half  = WINDMILL_BASE_HALF + (this_dy >> WINDMILL_SCALE_SHIFT);
+            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_half;
+
+            wire [9:0] this_sx = this_center - this_rhalf - TREE_GAP - SCEN_BASE_GAP - GAP_JIT - this_obj_half;
+
+            assign hp_left[gi] = IS_HOUSE ? house_at(x, y, this_sx, this_sy,
+                                                this_house_half[4:0], (this_house_half[4:0] >> 1) + 5'd2,
+                                                (this_house_half[4:0] >> 1) + 5'd3, this_house_half[4:0] + 5'd2)
+                                           : 3'b000;
+            assign wp_left[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
+                                                this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
+                                                (this_wind_half[4:0] <<< 1) + 5'd8, windmill_spin)
+                                              : 3'b000;
+        end
+
+        for (gi = 0; gi < NUM_SCENERY_SIDE; gi = gi + 1) begin : gen_right_scenery
+            localparam [15:0] SEED       = (gi * 16'd40503) + 16'd52237;
+            localparam [2:0]  TYPE_SEL   = SEED[2:0];
+            localparam [9:0]  PHASE_JIT  = {6'd0, SEED[6:3]};
+            localparam [9:0]  GAP_JIT    = {7'd0, SEED[9:7]} << 2;
+            localparam        IS_HOUSE   = (TYPE_SEL <= 3'd3);
+            localparam        IS_WINDMILL = (TYPE_SEL == 3'd4) || (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
+
+            localparam [9:0] base_sy = TREE_Y_MIN + (SCEN_Y_STEP >> 1) + SCEN_RIGHT_OFF + gi * SCEN_Y_STEP + PHASE_JIT;
+
+            wire [9:0] this_sy    = wrap_ty(base_sy, scroll_y);
+            wire [9:0] this_dy    = this_sy - TREE_Y_MIN;
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_house_half = HOUSE_BASE_HALF    + (this_dy >> HOUSE_SCALE_SHIFT);
+            wire [9:0] this_wind_half  = WINDMILL_BASE_HALF + (this_dy >> WINDMILL_SCALE_SHIFT);
+            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_half;
+
+            wire [9:0] this_sx = this_center + this_rhalf + TREE_GAP + SCEN_BASE_GAP + GAP_JIT + this_obj_half;
+
+            assign hp_right[gi] = IS_HOUSE ? house_at(x, y, this_sx, this_sy,
+                                                this_house_half[4:0], (this_house_half[4:0] >> 1) + 5'd2,
+                                                (this_house_half[4:0] >> 1) + 5'd3, this_house_half[4:0] + 5'd2)
+                                            : 3'b000;
+            assign wp_right[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
+                                                this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
+                                                (this_wind_half[4:0] <<< 1) + 5'd8, windmill_spin)
+                                               : 3'b000;
+        end
+    endgenerate
+
+    // Same reduction idiom as the trees above -- flatten all instances
+    // down to the category flags the color mux needs.
+    reg house_wall_lit, house_wall_shadow, house_roof, house_window, house_door;
+    reg windmill_tower_lit, windmill_tower_shadow, windmill_blade, windmill_hub;
+    integer hi_i;
+    always @(*) begin
+        house_wall_lit    = 1'b0;
+        house_wall_shadow = 1'b0;
+        house_roof        = 1'b0;
+        house_window      = 1'b0;
+        house_door        = 1'b0;
+        windmill_tower_lit    = 1'b0;
+        windmill_tower_shadow = 1'b0;
+        windmill_blade         = 1'b0;
+        windmill_hub            = 1'b0;
+        for (hi_i = 0; hi_i < NUM_SCENERY_SIDE; hi_i = hi_i + 1) begin
+            if (hp_left[hi_i] == 3'b001 || hp_right[hi_i] == 3'b001) house_wall_lit    = 1'b1;
+            if (hp_left[hi_i] == 3'b010 || hp_right[hi_i] == 3'b010) house_wall_shadow = 1'b1;
+            if (hp_left[hi_i] == 3'b011 || hp_right[hi_i] == 3'b011) house_roof        = 1'b1;
+            if (hp_left[hi_i] == 3'b100 || hp_right[hi_i] == 3'b100) house_window      = 1'b1;
+            if (hp_left[hi_i] == 3'b101 || hp_right[hi_i] == 3'b101) house_door        = 1'b1;
+
+            if (wp_left[hi_i] == 3'b001 || wp_right[hi_i] == 3'b001) windmill_tower_lit    = 1'b1;
+            if (wp_left[hi_i] == 3'b010 || wp_right[hi_i] == 3'b010) windmill_tower_shadow = 1'b1;
+            if (wp_left[hi_i] == 3'b011 || wp_right[hi_i] == 3'b011) windmill_blade        = 1'b1;
+            if (wp_left[hi_i] == 3'b100 || wp_right[hi_i] == 3'b100) windmill_hub          = 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Curve direction detection: no longer drawn as a diamond sign out
+    // in the 3D world -- replaced by a top-center HUD indicator (see
+    // the "curve direction HUD" block further down, near the score
+    // panel) so the player gets a clear on-screen "which way" cue
+    // instead of a roadside board that's easy to miss. These wires just
+    // say WHEN a turn is coming and WHICH way, driven off `phase`/
+    // `seg_dist` declared above -- the HUD block reuses them directly.
+    // ------------------------------------------------------------------
     localparam [19:0] SIGN_WINDOW = 20'd220;
 
     wire sign_upcoming_right = (phase == PHASE_STRAIGHT_1);
     wire sign_upcoming_left  = (phase == PHASE_STRAIGHT_2);
     wire sign_timing         = (seg_dist >= (SEGMENT_LENGTH - SIGN_WINDOW));
     wire sign_visible        = (sign_upcoming_right || sign_upcoming_left) && sign_timing;
-
-    // Function returns 0=nothing, 1=yellow face, 2=black arrow.
-    // Arrow is a simple sideways triangle using the same
-    // similar-triangles proportion trick as the (now-unused) old
-    // procedural mountains: at the base (ddx=0) the allowed |dy| is
-    // the full radius; it tapers linearly to 0 right at the tip
-    // (ddx==2*R), so "2*|dy| + ddx <= 2*R" traces a clean triangle
-    // with no division needed.
-    function [1:0] sign_at;
-        input [9:0] px, py;
-        input [9:0] sx, sy;   // sign center
-        input [4:0] half;      // diamond radius
-        input       dir;        // 0 = arrow points left, 1 = arrow points right
-        reg signed [10:0] ddx, ddy, adx, ady;
-        reg signed [10:0] arrow_r;
-        reg signed [10:0] ddx_tri;
-        begin
-            ddx = $signed({1'b0, px}) - $signed({1'b0, sx});
-            ddy = $signed({1'b0, py}) - $signed({1'b0, sy});
-            adx = ddx[10] ? -ddx : ddx;
-            ady = ddy[10] ? -ddy : ddy;
-
-            arrow_r = $signed({1'b0, half}) >>> 1; // arrow a bit smaller than the diamond itself
-            ddx_tri = dir ? (ddx + arrow_r) : (arrow_r - ddx);
-
-            if ((adx + ady) > $signed({1'b0, half}))
-                sign_at = 2'd0; // outside the diamond entirely
-            else if ((ddx_tri >= 11'sd0) && (ddx_tri <= (arrow_r <<< 1)) &&
-                     ((ady <<< 1) + ddx_tri <= (arrow_r <<< 1)))
-                sign_at = 2'd2; // black arrow
-            else
-                sign_at = 2'd1; // yellow diamond background
-        end
-    endfunction
-
-    // ------------------------------------------------------------------
-    // Sign post: a plain vertical pole standing directly under the
-    // diamond, so the sign reads as "planted on the shoulder" instead
-    // of floating. Same cel-shaded lit/shadow split as the tree trunks
-    // (px < sx = lit side), and it scales with `half` so it grows in
-    // step with the diamond as the sign approaches.
-    // Returns: 0 = none, 1 = post lit side, 2 = post shadow side.
-    // ------------------------------------------------------------------
-    function [1:0] post_at;
-        input [9:0] px, py;
-        input [9:0] sx, sy;   // sign center (sy = diamond center row)
-        input [4:0] half;     // diamond radius -- post scales off this
-        reg   [9:0] pw;       // post half-width
-        reg   [9:0] post_top, post_bot;
-        begin
-            pw = {5'd0, half} >> 2;
-            if (pw < 10'd1) pw = 10'd1;
-
-            post_top = sy + {5'd0, half};              // right where the diamond's bottom point sits
-            post_bot = post_top + ({5'd0, half} <<< 1); // extends down twice the diamond radius
-
-            if ((px >= sx - pw) && (px <= sx + pw) &&
-                (py >= post_top) && (py <= post_bot))
-                post_at = (px < sx) ? 2'd1 : 2'd2;
-            else
-                post_at = 2'd0;
-        end
-    endfunction
-
-    wire [1:0] sign_p0, sign_p1;
-
-    // Instance 0
-    wire [9:0] sign0_ty    = wrap_ty(TREE_Y_MIN + (SIGN_Y_STEP >> 2), scroll_y);
-    wire [9:0] sign0_dy    = sign0_ty - TREE_Y_MIN;
-    wire [9:0] sign0_half  = SIGN_BASE_HALF + (sign0_dy >> SIGN_SCALE_SHIFT);
-    wire [9:0] sign0_rhalf = ROAD_HALF_FAR + (sign0_dy >> 1);
-    wire signed [13:0] sign0_cshift = curve_shift_at(curve_amount, sign0_dy);
-    wire signed [13:0] sign0_censig = $signed({1'b0, ROAD_CENTER_X}) + sign0_cshift;
-    wire [9:0] sign0_center = clamp_center_x(sign0_censig, 10'd5);
-    wire [9:0] sign0_sx = sign0_center + sign0_rhalf + SIGN_GAP + sign0_half;
-
-    assign sign_p0 = sign_visible ? sign_at(x, y, sign0_sx, sign0_ty, sign0_half[4:0], sign_upcoming_right) : 2'd0;
-
-    // Instance 1 -- staggered halfway through the cycle
-    wire [9:0] sign1_ty    = wrap_ty(TREE_Y_MIN + (SIGN_Y_STEP >> 2) + (SIGN_Y_STEP >> 1), scroll_y);
-    wire [9:0] sign1_dy    = sign1_ty - TREE_Y_MIN;
-    wire [9:0] sign1_half  = SIGN_BASE_HALF + (sign1_dy >> SIGN_SCALE_SHIFT);
-    wire [9:0] sign1_rhalf = ROAD_HALF_FAR + (sign1_dy >> 1);
-    wire signed [13:0] sign1_cshift = curve_shift_at(curve_amount, sign1_dy);
-    wire signed [13:0] sign1_censig = $signed({1'b0, ROAD_CENTER_X}) + sign1_cshift;
-    wire [9:0] sign1_center = clamp_center_x(sign1_censig, 10'd5);
-    wire [9:0] sign1_sx = sign1_center + sign1_rhalf + SIGN_GAP + sign1_half;
-
-    assign sign_p1 = sign_visible ? sign_at(x, y, sign1_sx, sign1_ty, sign1_half[4:0], sign_upcoming_right) : 2'd0;
-
-    wire sign_face  = (sign_p0 == 2'd1) || (sign_p1 == 2'd1);
-    wire sign_arrow = (sign_p0 == 2'd2) || (sign_p1 == 2'd2);
-
-    wire [1:0] post_p0 = sign_visible ? post_at(x, y, sign0_sx, sign0_ty, sign0_half[4:0]) : 2'd0;
-    wire [1:0] post_p1 = sign_visible ? post_at(x, y, sign1_sx, sign1_ty, sign1_half[4:0]) : 2'd0;
-
-    wire sign_post_lit    = (post_p0 == 2'd1) || (post_p1 == 2'd1);
-    wire sign_post_shadow = (post_p0 == 2'd2) || (post_p1 == 2'd2);
 
 	 // ================= Background ROM =================
 	wire [16:0] bg_addr;
@@ -831,13 +1003,29 @@ module render_static (
                          (x <= curved_center_x + (line_thick >> 1)) &&
                          (anim_y[5] == 1'b0);
    
+    assign trotoar_left  = (y >= 10'd120) &&
+                            (x >= road_left - TROTOAR_WIDTH) &&
+                            (x <  road_left);
+
+    assign trotoar_right = (y >= 10'd120) &&
+                            (x >  road_right) &&
+                            (x <= road_right + TROTOAR_WIDTH);
+
     assign shoulder_left  = (y >= 10'd120) &&
-                             (x >= road_left - SHOULDER_WIDTH) &&
-                             (x <  road_left);
+                             (x >= road_left - TROTOAR_WIDTH - SHOULDER_WIDTH) &&
+                             (x <  road_left - TROTOAR_WIDTH);
 
     assign shoulder_right = (y >= 10'd120) &&
-                             (x >  road_right) &&
-                             (x <= road_right + SHOULDER_WIDTH);
+                             (x >  road_right + TROTOAR_WIDTH) &&
+                             (x <= road_right + TROTOAR_WIDTH + SHOULDER_WIDTH);
+
+    // Stripe pattern for the curb: toggles black/white every few rows
+    // of world-scroll (anim_y), same "cheap XOR/bit-toggle" idiom used
+    // for the dashed center line and asphalt speckle above, so the
+    // stripes visibly scroll toward the camera along with everything
+    // else. A little wider-spaced (bit 4) than the center dash (bit 5)
+    // so the two don't look identical.
+    wire trotoar_stripe = anim_y[4];
 
 localparam CAR_W = 10'd128;
     localparam CAR_H = 10'd128;
@@ -1045,18 +1233,46 @@ localparam CAR_W = 10'd128;
     reg       obstacle_overlap_prev; // overlap state one frame ago, for edge detection
 
     // ------------------------------------------------------------------
-    // Lives: 3 chances instead of instant game over. Each hit costs one
-    // life AND LIFE_LOST_PENALTY points (which also naturally lowers
-    // obstacle_speed_bonus/difficulty since that's derived straight
-    // from `score` -- no separate "slow back down" logic needed, it
-    // falls out of the existing difficulty formula for free). Only the
-    // hit that takes the LAST life actually sets game_over.
+    // Lives: 3 starting chances, up to LIVES_MAX -- extra lives now come
+    // from catching the star pickup (see below) instead of an automatic
+    // score threshold. Each hit costs one life AND LIFE_LOST_PENALTY
+    // points (which also naturally lowers obstacle_speed_bonus/
+    // difficulty since that's derived straight from `score` -- no
+    // separate "slow back down" logic needed, it falls out of the
+    // existing difficulty formula for free). Only the hit that takes
+    // the LAST life actually sets game_over. Widened to 3 bits (was 2)
+    // so lives can go past 3 once bonus lives start coming in.
     // ------------------------------------------------------------------
-    localparam [1:0]  LIVES_START       = 2'd3;
+    localparam [2:0]  LIVES_START       = 3'd3;
+    localparam [2:0]  LIVES_MAX         = 3'd5;
     localparam [15:0] LIFE_LOST_PENALTY = 16'd10;
 
-    reg [1:0] lives;
+    reg [2:0] lives;
     initial lives = LIVES_START;
+
+    // ------------------------------------------------------------------
+    // Bonus-life pickup: a star that travels down the road exactly like
+    // an obstacle (same lane/perspective/speed math), but drawn as a
+    // gold 4-point sparkle instead of a hazard drum so the player can
+    // instantly tell it's good, not bad. Touching it with the car grants
+    // +1 life (capped at LIVES_MAX) instead of costing one. Spawns on
+    // its own timer, independent of the obstacle's spawn/respawn cycle.
+    // ------------------------------------------------------------------
+    localparam [15:0] BONUS_SPAWN_INTERVAL = 16'd480; // frames between star spawns (~8s @ 60fps)
+    localparam [9:0]  BONUS_BASE_R         = 10'd5;   // star radius at the horizon (small/far away)
+    localparam        BONUS_SCALE_SHIFT    = 4;       // how fast it grows with distance (same idea as the obstacle)
+
+    reg        bonus_active;
+    reg [9:0]  bonus_y;
+    reg [1:0]  bonus_lane;
+    reg        bonus_overlap_prev;
+    reg [15:0] bonus_spawn_timer;
+
+    initial bonus_active       = 1'b0;
+    initial bonus_y            = OBS_Y_START;
+    initial bonus_lane         = 2'd1;
+    initial bonus_overlap_prev = 1'b0;
+    initial bonus_spawn_timer  = BONUS_SPAWN_INTERVAL;
 
     initial obstacle_y            = OBS_Y_START;
     initial obstacle_lane         = 2'd1;
@@ -1125,6 +1341,73 @@ localparam CAR_W = 10'd128;
     wire [9:0] obs_mid_band = obs_half_h >> 2;
     wire obs_is_stripe = (obs_row_rel >= -$signed({1'b0, obs_mid_band})) && (obs_row_rel <= $signed({1'b0, obs_mid_band}));
 
+    // ------------------------------------------------------------------
+    // Bonus star pickup: exactly the same perspective/lane math the
+    // obstacle uses (own distance dy_bonus -> curve_shift -> lane
+    // offset -> clamp), just evaluated for bonus_y/bonus_lane instead
+    // -- so it travels down the road, follows the curve, and scales
+    // with distance the same way the obstacle does.
+    // ------------------------------------------------------------------
+    wire [9:0] dy_bonus                    = bonus_y - 10'd120;
+    wire signed [13:0] curve_shift_bonus   = curve_shift_at(curve_amount, dy_bonus);
+    wire signed [13:0] center_x_bonus_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_bonus;
+    wire [9:0] road_half_bonus             = ROAD_HALF_FAR + (dy_bonus >> 1);
+
+    wire signed [10:0] bonus_lane_offset = (bonus_lane == 2'd0) ? -$signed({1'b0, road_half_bonus}) >>> 1 :
+                                            (bonus_lane == 2'd2) ?  $signed({1'b0, road_half_bonus}) >>> 1 :
+                                                                     11'sd0;
+
+    wire signed [10:0] bonus_x_signed = center_x_bonus_signed + bonus_lane_offset;
+    wire [9:0] bonus_x = clamp_center_x(bonus_x_signed, 10'd25);
+    wire [9:0] bonus_r = BONUS_BASE_R + (dy_bonus >> BONUS_SCALE_SHIFT);
+
+    // ------------------------------------------------------------------
+    // Shape test: a small 4-point gold sparkle/star -- a tiny diamond
+    // body with two tapering spikes along the axes (top/bottom,
+    // left/right). The taper reuses the exact same cross-multiplication
+    // "similar triangles" trick the curve warning arrow used to (no
+    // division needed): at the center the spike is `thick` pixels wide,
+    // shrinking linearly to a point at distance `r`. Deliberately a very
+    // different silhouette from the obstacle's square hazard drum, so
+    // the player can tell at a glance this one is good to touch.
+    // Returns: 0 = none, 1 = star body/spike, 2 = bright core.
+    // ------------------------------------------------------------------
+    function [1:0] star_at;
+        input [9:0] px, py;
+        input [9:0] sx, sy;
+        input [4:0] r;
+        reg signed [10:0] ddx, ddy;
+        reg [10:0] adx, ady;
+        reg [10:0] thick, rr;
+        reg core, body, vspike, hspike;
+        begin
+            ddx = $signed({1'b0, px}) - $signed({1'b0, sx});
+            ddy = $signed({1'b0, py}) - $signed({1'b0, sy});
+            adx = ddx[10] ? (-ddx) : ddx;
+            ady = ddy[10] ? (-ddy) : ddy;
+            rr    = {6'd0, r};
+            thick = rr >> 2;
+            if (thick < 11'd1) thick = 11'd1;
+
+            core   = (adx + ady) <= (rr >> 2);
+            body   = (adx + ady) <= (rr >> 1);
+            vspike = (ady <= rr) && (adx * rr <= thick * (rr - ady));
+            hspike = (adx <= rr) && (ady * rr <= thick * (rr - adx));
+
+            if (core)
+                star_at = 2'd2;
+            else if (body || vspike || hspike)
+                star_at = 2'd1;
+            else
+                star_at = 2'd0;
+        end
+    endfunction
+
+    wire [1:0] bonus_shape  = bonus_active ? star_at(x, y, bonus_x, bonus_y, bonus_r[4:0]) : 2'd0;
+    wire is_bonus_area = (bonus_shape != 2'd0);
+    wire bonus_core    = (bonus_shape == 2'd2);
+    wire bonus_body    = (bonus_shape == 2'd1);
+
     // ---- Collision box test (car vs obstacle), purely from registers
     // -- re-evaluated combinationally every time, but only actually
     // *sampled* once per frame below.
@@ -1164,6 +1447,24 @@ localparam CAR_W = 10'd128;
     // is watching this signal for a single crash.
     wire collision_edge = obstacle_car_overlap && !obstacle_overlap_prev;
 
+    // ------------------------------------------------------------------
+    // Star pickup collision: same rectangular-box overlap + rising-edge
+    // idiom as the obstacle above, just against bonus_x/bonus_y/bonus_r
+    // instead -- touching the star (car hitbox overlaps its bounding
+    // box) is a "catch", not a crash.
+    // ------------------------------------------------------------------
+    wire signed [10:0] bonus_left_s   = $signed({1'b0, bonus_x}) - $signed({1'b0, bonus_r});
+    wire signed [10:0] bonus_right_s  = $signed({1'b0, bonus_x}) + $signed({1'b0, bonus_r});
+    wire signed [10:0] bonus_top_s    = $signed({1'b0, bonus_y}) - $signed({1'b0, bonus_r});
+    wire signed [10:0] bonus_bottom_s = $signed({1'b0, bonus_y}) + $signed({1'b0, bonus_r});
+
+    wire bonus_car_overlap = bonus_active &&
+                              (bonus_left_s   < car_right_s) && (bonus_right_s  > car_left_s) &&
+                              (bonus_top_s    < car_bottom_s) && (bonus_bottom_s > car_top_s);
+
+    wire bonus_collision_edge = bonus_car_overlap && !bonus_overlap_prev;
+    wire bonus_reached_end    = bonus_active && ((bonus_y + OBSTACLE_SPEED) >= OBS_Y_END);
+
     // Points awarded each time an obstacle is successfully dodged
     // (reaches the end of the road without a collision this frame).
     localparam [15:0] POINTS_PER_DODGE = 16'd10;
@@ -1195,6 +1496,11 @@ localparam CAR_W = 10'd128;
             game_over              <= 1'b0;
             combo_count            <= 8'd0;
             lives                  <= LIVES_START;
+            bonus_active           <= 1'b0;
+            bonus_y                <= OBS_Y_START;
+            bonus_lane             <= 2'd1;
+            bonus_overlap_prev     <= 1'b0;
+            bonus_spawn_timer      <= BONUS_SPAWN_INTERVAL;
         end else if (x == 10'd0 && y == 10'd0 && game_started) begin   // sekali per frame, tapi cuma setelah start ditekan
             // 8-bit maximal-length Fibonacci LFSR (taps 8,6,5,4).
             // Advancing this by a fixed number of steps each respawn
@@ -1215,11 +1521,11 @@ localparam CAR_W = 10'd128;
                     combo_count <= 8'd0;
                     score       <= (score >= LIFE_LOST_PENALTY) ? (score - LIFE_LOST_PENALTY) : 16'd0;
 
-                    if (lives <= 2'd1) begin
-                        lives     <= 2'd0;
+                    if (lives <= 3'd1) begin
+                        lives     <= 3'd0;
                         game_over <= 1'b1;
                     end else begin
-                        lives <= lives - 2'd1;
+                        lives <= lives - 3'd1;
                     end
                 end else if (obstacle_reached_end) begin
                     // Made it past this obstacle without hitting it --
@@ -1239,8 +1545,42 @@ localparam CAR_W = 10'd128;
                 end else begin
                     obstacle_y <= obstacle_y + OBSTACLE_SPEED;
                 end
+
+                // ------------------------------------------------------
+                // Star pickup: independent of the obstacle above -- its
+                // own spawn timer, own travel/lane, own overlap edge.
+                // Catching it (bonus_collision_edge) grants +1 life (if
+                // under the cap) and immediately retires the star;
+                // missing it (bonus_reached_end) just retires it with no
+                // penalty. Either way bonus_spawn_timer restarts the
+                // countdown to the next star.
+                // ------------------------------------------------------
+                bonus_overlap_prev <= bonus_car_overlap;
+
+                if (bonus_active) begin
+                    if (bonus_collision_edge) begin
+                        bonus_active       <= 1'b0;
+                        bonus_spawn_timer  <= BONUS_SPAWN_INTERVAL;
+                        if (lives < LIVES_MAX)
+                            lives <= lives + 3'd1;
+                    end else if (bonus_reached_end) begin
+                        bonus_active      <= 1'b0;
+                        bonus_spawn_timer <= BONUS_SPAWN_INTERVAL;
+                    end else begin
+                        bonus_y <= bonus_y + OBSTACLE_SPEED;
+                    end
+                end else begin
+                    if (bonus_spawn_timer <= 16'd1) begin
+                        bonus_active           <= 1'b1;
+                        bonus_y                <= OBS_Y_START;
+                        bonus_lane             <= next_lane; // reuses the obstacle LFSR's lane pick -- already decorrelated from the obstacle's own spawn timing
+                        bonus_overlap_prev     <= 1'b0;
+                    end else begin
+                        bonus_spawn_timer <= bonus_spawn_timer - 16'd1;
+                    end
+                end
             end
-            // if game_over is already high, obstacle/score/lives are
+            // if game_over is already high, obstacle/star/score/lives are
             // frozen in place until reset is asserted.
         end else if (x == 10'd0 && y == 10'd0) begin
             // Belum start_btn ditekan: obstacle_rand tetap dianggurkan,
@@ -1493,18 +1833,18 @@ localparam CAR_W = 10'd128;
     wire [19:0] score_bcd      = bin_to_bcd(score);
     wire [19:0] high_score_bcd = bin_to_bcd(high_score);
 
-    // ---- Score HUD position: top-left, 5 digits, scaled up to match
-    // the GAME OVER text (SCALE=4) so it's actually easy to read, sat
-    // on top of a dark panel with a bright border so it stands out
-    // against the sky/mountain background behind it instead of
-    // blending in.
+    // ---- Score HUD position: top-left, 5 digits. Shrunk down (16px
+    // cell / 2x glyph scale, was 32px cell / 4x scale) so the panel
+    // takes up noticeably less screen real-estate while staying on a
+    // power-of-2 cell size (16 = 2^4, scale 2 = 2^1) so every pixel
+    // lookup below is still a free bit-slice, no dividers needed.
     localparam SCORE_X0 = 10'd20;
-    localparam SCORE_Y0 = 10'd16;
+    localparam SCORE_Y0 = 10'd14;
     localparam SCORE_DIGITS = 4'd5;
-    localparam SCORE_CELL = 10'd32; // 32px cell per digit (SCALE=4 glyph + padding)
+    localparam SCORE_CELL = 10'd16; // 16px cell per digit (SCALE=2 glyph + padding)
 
-    localparam SCORE_PANEL_MARGIN = 10'd10;
-    localparam SCORE_BORDER_THICK = 10'd3;
+    localparam SCORE_PANEL_MARGIN = 10'd6;
+    localparam SCORE_BORDER_THICK = 10'd2;
 
     wire [9:0] score_box_w = SCORE_DIGITS * SCORE_CELL;
     wire [9:0] score_box_h = SCORE_CELL;
@@ -1525,9 +1865,9 @@ localparam CAR_W = 10'd128;
 
     wire [9:0] score_xrel = x - SCORE_X0;
     wire [9:0] score_yrel = y - SCORE_Y0;
-    wire [3:0] score_digit_idx = score_xrel[9:5];          // /32
-    wire [2:0] score_col       = score_xrel[4:0] >> 2;      // within-cell col, /4 (SCALE)
-    wire [2:0] score_row       = score_yrel[4:0] >> 2;      // within-cell row, /4 (SCALE)
+    wire [3:0] score_digit_idx = score_xrel[9:4];          // /16
+    wire [2:0] score_col       = score_xrel[3:0] >> 1;      // within-cell col, /2 (SCALE)
+    wire [2:0] score_row       = score_yrel[3:0] >> 1;      // within-cell row, /2 (SCALE)
 
     // Pick the BCD nibble for whichever digit column we're in.
     wire [3:0] score_digit_val = (score_digit_idx == 4'd0) ? score_bcd[19:16] :
@@ -1540,15 +1880,15 @@ localparam CAR_W = 10'd128;
     wire score_glyph_bit = in_score_box && (score_col < 3'd5) && (score_row < 3'd7) &&
                             score_glyph_row[4 - score_col];
 
-    // ---- High-score HUD: label "HI" + 5 digits, same visual style as
-    // the score panel, sat directly underneath it -- this is the
-    // "history"/best-run readout, and it survives game resets because
-    // high_score itself is never cleared by `reset`.
+    // ---- High-score HUD: label "HI" + 5 digits, same shrunk visual
+    // style as the score panel, sat directly underneath it -- this is
+    // the "history"/best-run readout, and it survives game resets
+    // because high_score itself is never cleared by `reset`.
     localparam HI_LABEL_CHARS = 4'd2;
     localparam HI_DIGITS      = 4'd5;
-    localparam HI_CELL        = 10'd32;
+    localparam HI_CELL        = 10'd16;
     localparam HI_X0 = SCORE_X0;
-    localparam HI_Y0 = 10'd70; // just below the score panel (which ends around y=58)
+    localparam HI_Y0 = 10'd38; // just below the (now smaller) score panel
 
     wire [9:0] hi_box_w = (HI_LABEL_CHARS + HI_DIGITS) * HI_CELL;
     wire [9:0] hi_box_h = HI_CELL;
@@ -1567,9 +1907,9 @@ localparam CAR_W = 10'd128;
 
     wire [9:0] hi_xrel = x - HI_X0;
     wire [9:0] hi_yrel = y - HI_Y0;
-    wire [3:0] hi_cell_idx = hi_xrel[9:5];        // /32, which of the 7 cells (2 label + 5 digits)
-    wire [2:0] hi_col      = hi_xrel[4:0] >> 2;
-    wire [2:0] hi_row      = hi_yrel[4:0] >> 2;
+    wire [3:0] hi_cell_idx = hi_xrel[9:4];        // /16, which of the 7 cells (2 label + 5 digits)
+    wire [2:0] hi_col      = hi_xrel[3:0] >> 1;
+    wire [2:0] hi_row      = hi_yrel[3:0] >> 1;
 
     // First two cells are the "H" and "I" label glyphs; the remaining
     // five are digits from high_score_bcd.
@@ -1633,11 +1973,13 @@ localparam CAR_W = 10'd128;
                        (x >= ST_X0 - SCORE_PANEL_MARGIN) && (x < ST_X0 + (ST_CHARS * 10'd32) + SCORE_PANEL_MARGIN) &&
                        (y >= ST_Y0 - SCORE_PANEL_MARGIN) && (y < ST_Y0 + 10'd32 + SCORE_PANEL_MARGIN);
 
-    // ---- Lives panel: same visual family as the score/high-score
-    // panels, showing a single digit (0-3). Sits just below high score.
+    // ---- Lives panel: same shrunk visual family as the score/
+    // high-score panels above, showing a single digit (0-5 now that
+    // bonus lives can push past the original 3). Sits just below high
+    // score.
     localparam LIVES_X0 = SCORE_X0;
-    localparam LIVES_Y0 = HI_Y0 + HI_CELL + SCORE_PANEL_MARGIN * 2 + 10'd10; // stacked below the HI panel
-    localparam LIVES_CELL = 10'd32;
+    localparam LIVES_Y0 = HI_Y0 + HI_CELL + SCORE_PANEL_MARGIN * 2 + 10'd6; // stacked below the HI panel
+    localparam LIVES_CELL = 10'd16;
 
     wire [9:0] lives_box_w = LIVES_CELL;
     wire [9:0] lives_box_h = LIVES_CELL;
@@ -1656,12 +1998,61 @@ localparam CAR_W = 10'd128;
 
     wire [9:0] lives_xrel = x - LIVES_X0;
     wire [9:0] lives_yrel = y - LIVES_Y0;
-    wire [2:0] lives_col  = lives_xrel[4:0] >> 2;
-    wire [2:0] lives_row  = lives_yrel[4:0] >> 2;
+    wire [2:0] lives_col  = lives_xrel[3:0] >> 1;
+    wire [2:0] lives_row  = lives_yrel[3:0] >> 1;
 
-    wire [4:0] lives_glyph_row = glyph_row({3'd0, lives}, lives_row);
+    wire [4:0] lives_glyph_row = glyph_row({2'd0, lives}, lives_row);
     wire lives_glyph_bit = in_lives_box && (lives_col < 3'd5) && (lives_row < 3'd7) &&
                            lives_glyph_row[4 - lives_col];
+
+    // ------------------------------------------------------------------
+    // Curve-direction HUD: a solid triangle/chevron pinned to the top
+    // center of the screen, pointing whichever way the upcoming curve
+    // bends -- replaces the old in-world roadside diamond sign, which
+    // was easy to miss. Reuses sign_upcoming_left/right/sign_visible
+    // (declared with the road-curve logic) for WHEN and WHICH way,
+    // same triangle "similar triangles" cross-multiplication the old
+    // sign's arrow used, just drawn as a fixed-position HUD element
+    // instead of an object out in the 3D world.
+    // ------------------------------------------------------------------
+    function hud_arrow_at;
+        input [9:0] px, py, cx, cy;
+        input [4:0] half;
+        input       dir;   // 0 = points left, 1 = points right
+        reg signed [10:0] ddx, ddy, ady;
+        reg signed [10:0] ddx_tri, r;
+        begin
+            ddx = $signed({1'b0, px}) - $signed({1'b0, cx});
+            ddy = $signed({1'b0, py}) - $signed({1'b0, cy});
+            ady = ddy[10] ? -ddy : ddy;
+            r   = $signed({1'b0, half});
+            ddx_tri = dir ? (ddx + r) : (r - ddx);
+            hud_arrow_at = (ddx_tri >= 11'sd0) && (ddx_tri <= (r <<< 1)) &&
+                           ((ady <<< 1) + ddx_tri <= (r <<< 1));
+        end
+    endfunction
+
+    localparam [9:0] CURVE_HUD_W      = 10'd64;
+    localparam [9:0] CURVE_HUD_H      = 10'd34;
+    localparam [9:0] CURVE_HUD_X0     = (10'd640 - CURVE_HUD_W) >> 1; // centered horizontally
+    localparam [9:0] CURVE_HUD_Y0     = 10'd6;
+    localparam [9:0] CURVE_HUD_BORDER = 10'd2;
+
+    wire in_curve_hud_panel = sign_visible &&
+                              (x >= CURVE_HUD_X0) && (x < CURVE_HUD_X0 + CURVE_HUD_W) &&
+                              (y >= CURVE_HUD_Y0) && (y < CURVE_HUD_Y0 + CURVE_HUD_H);
+
+    wire in_curve_hud_border = in_curve_hud_panel &&
+                              ((x < CURVE_HUD_X0 + CURVE_HUD_BORDER) ||
+                               (x >= CURVE_HUD_X0 + CURVE_HUD_W - CURVE_HUD_BORDER) ||
+                               (y < CURVE_HUD_Y0 + CURVE_HUD_BORDER) ||
+                               (y >= CURVE_HUD_Y0 + CURVE_HUD_H - CURVE_HUD_BORDER));
+
+    wire [9:0] curve_hud_cx = CURVE_HUD_X0 + (CURVE_HUD_W >> 1);
+    wire [9:0] curve_hud_cy = CURVE_HUD_Y0 + (CURVE_HUD_H >> 1);
+
+    wire curve_hud_arrow_pixel = sign_visible &&
+                                  hud_arrow_at(x, y, curve_hud_cx, curve_hud_cy, 5'd12, sign_upcoming_right);
 
     reg [7:0] terrain_r, terrain_g, terrain_b;
 
@@ -1690,6 +2081,18 @@ localparam CAR_W = 10'd128;
                 red   = 8'd235;
                 green = 8'd120;
                 blue  = 8'd35;
+            end
+        end
+
+        else if (is_bonus_area) begin
+            if (bonus_core) begin
+                red   = 8'd255;
+                green = 8'd255;
+                blue  = 8'd230;   // bright near-white core
+            end else begin
+                red   = 8'd255;
+                green = 8'd205;
+                blue  = 8'd40;    // gold sparkle body
             end
         end
 
@@ -1737,6 +2140,19 @@ localparam CAR_W = 10'd128;
                 terrain_r = blend4(8'd140, 8'd56, road_edge_w);
                 terrain_g = blend4(8'd116, 8'd52, road_edge_w);
                 terrain_b = blend4(8'd148, 8'd76, road_edge_w);
+            end
+
+            else if (trotoar_left || trotoar_right) begin
+                // Black-and-white striped kerb, like a real roadside curb.
+                if (trotoar_stripe) begin
+                    terrain_r = 8'd235;
+                    terrain_g = 8'd235;
+                    terrain_b = 8'd235;
+                end else begin
+                    terrain_r = 8'd18;
+                    terrain_g = 8'd18;
+                    terrain_b = 8'd18;
+                end
             end
 
             else if (shoulder_left || shoulder_right) begin
@@ -1788,32 +2204,67 @@ localparam CAR_W = 10'd128;
                 terrain_b = 8'd68;
             end
 
-            else if (sign_arrow) begin
-                // Black arrow on the warning sign.
-                terrain_r = 8'd20;
-                terrain_g = 8'd18;
-                terrain_b = 8'd16;
+            else if (house_roof) begin
+                // Dark brick-red roof.
+                terrain_r = 8'd140;
+                terrain_g = 8'd58;
+                terrain_b = 8'd48;
             end
 
-            else if (sign_face) begin
-                // Yellow diamond warning-sign background.
+            else if (house_door) begin
+                // Warm wooden door.
+                terrain_r = 8'd96;
+                terrain_g = 8'd64;
+                terrain_b = 8'd44;
+            end
+
+            else if (house_window) begin
+                // Glowing warm window light -- houses look inhabited.
+                terrain_r = 8'd250;
+                terrain_g = 8'd220;
+                terrain_b = 8'd120;
+            end
+
+            else if (house_wall_lit) begin
+                // Cream/adobe wall, lit side.
+                terrain_r = 8'd222;
+                terrain_g = 8'd196;
+                terrain_b = 8'd160;
+            end
+
+            else if (house_wall_shadow) begin
+                // Wall, shadow side.
+                terrain_r = 8'd168;
+                terrain_g = 8'd146;
+                terrain_b = 8'd120;
+            end
+
+            else if (windmill_blade) begin
+                // Bleached cream blades -- bright so the spin flip reads clearly.
                 terrain_r = 8'd235;
-                terrain_g = 8'd190;
-                terrain_b = 8'd40;
+                terrain_g = 8'd228;
+                terrain_b = 8'd210;
             end
 
-            else if (sign_post_lit) begin
-                // Sign post, lit side -- plain weathered grey wood/metal.
-                terrain_r = 8'd150;
-                terrain_g = 8'd142;
-                terrain_b = 8'd132;
+            else if (windmill_hub) begin
+                // Small dark hub at the blade center.
+                terrain_r = 8'd45;
+                terrain_g = 8'd40;
+                terrain_b = 8'd38;
             end
 
-            else if (sign_post_shadow) begin
-                // Sign post, shadow side.
-                terrain_r = 8'd104;
-                terrain_g = 8'd98;
-                terrain_b = 8'd90;
+            else if (windmill_tower_lit) begin
+                // Weathered stone tower, lit side.
+                terrain_r = 8'd188;
+                terrain_g = 8'd176;
+                terrain_b = 8'd162;
+            end
+
+            else if (windmill_tower_shadow) begin
+                // Tower, shadow side.
+                terrain_r = 8'd132;
+                terrain_g = 8'd122;
+                terrain_b = 8'd112;
             end
 
             else if (flower_pixel) begin
@@ -1930,6 +2381,23 @@ localparam CAR_W = 10'd128;
                 red   = 8'd255;
                 green = 8'd100;
                 blue  = 8'd100;   // red-ish "lives" digit
+            end
+
+            if (in_curve_hud_panel) begin
+                if (in_curve_hud_border) begin
+                    red   = 8'd255;
+                    green = 8'd190;
+                    blue  = 8'd40;    // amber warning border, same family as the old sign
+                end else begin
+                    red   = 8'd18;
+                    green = 8'd16;
+                    blue  = 8'd30;
+                end
+            end
+            if (curve_hud_arrow_pixel) begin
+                red   = 8'd255;
+                green = 8'd225;
+                blue  = 8'd60;    // bright yellow chevron
             end
 
             if (in_st_panel) begin
