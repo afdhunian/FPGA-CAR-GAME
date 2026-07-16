@@ -300,15 +300,12 @@ module render_static (
     assign left_line_edge_aa  = road_area && (x == road_left  + line_margin - 10'd1);
     assign right_line_edge_aa = road_area && (x == road_right - line_margin + 10'd1);
 
-    // Dirt/gravel shoulder: a narrow strip just outside the asphalt on
-    // both sides, so the road doesn't cut straight to grass.
-    localparam SHOULDER_WIDTH = 6;
-    wire shoulder_left, shoulder_right;
+    // Dirt/gravel shoulder removed -- grass now runs right up to the
+    // trotoar/curb instead of a separate dirt strip beyond it.
 
     // Trotoar (sidewalk curb): a thin black-and-white striped band
     // sitting right at the road's edge, between the asphalt and the
-    // dirt shoulder -- like the painted kerb stones on a real road.
-    // Sits INSIDE (closer to the road than) the gravel shoulder below.
+    // grass -- like the painted kerb stones on a real road.
     localparam TROTOAR_WIDTH = 10'd6;
     wire trotoar_left, trotoar_right;
 
@@ -356,76 +353,9 @@ module render_static (
     assign grass_speck_a = x[0] ^ anim_y[0];
     assign grass_speck_b = x[2] ^ anim_y[2];
 
-    // ------------------------------------------------------------------
-    // Grass decorations: flowers, small rocks, and tall-grass clumps.
-    //
-    // Same cheap idea as asphalt_fleck/grass_speck above, just split
-    // into two stages so the "on" regions are small dots/blobs instead
-    // of big 16x16 blocks:
-    //   1. Chop the screen into 16x16 cells (world-space, scrolling
-    //      with anim_y like everything else) and hash each cell's
-    //      coordinates to decide IF that cell gets a decoration.
-    //   2. Use the cell-LOCAL coordinates (the low 4 bits) to place a
-    //      small shape (a dot, a blob, a few blades) within that cell.
-    //
-    // No per-object registers/instances needed -- it's just a handful
-    // of comparisons, same spirit as the fleck/speck technique already
-    // used for asphalt and base grass texture.
-    // ------------------------------------------------------------------
-    // ------------------------------------------------------------------
-    // Curve-corrected x for anything that should visually "ride along"
-    // with the bending road (grass decorations here, same idea as how
-    // trees/signs are positioned relative to curved_center_x below) --
-    // without this, the decoration grid stays glued to the screen while
-    // the road/trees swing left and right around it, which looks wrong.
-    // Reuses the exact same curve_shift_at function the road/trees/car/
-    // obstacle all share, so the grass rides along in perfect agreement
-    // with everything else instead of using its own cruder approximation.
-    // ------------------------------------------------------------------
-    wire signed [13:0] row_curve_shift = curve_shift_at(curve_amount, dy);
-    wire signed [14:0] deco_x_signed = $signed({1'b0, x}) - row_curve_shift;
-    wire [9:0] deco_world_x = deco_x_signed[9:0]; // only ever used for hashing, so wraparound at the edges is harmless
-
-    wire [5:0] deco_cx = deco_world_x[9:4];   // which 16px cell, horizontally -- now curve-corrected
-    wire [5:0] deco_cy = anim_y[9:4]; // which 16px cell, vertically (scrolls with the world)
-    wire [3:0] deco_lx = deco_world_x[3:0];   // position within the cell, 0..15 -- also curve-corrected
-    wire [3:0] deco_ly = anim_y[3:0];
-
-    // Cheap scramble so cells don't light up in an obvious diagonal
-    // stripe pattern -- doesn't need to be a "good" hash, just enough
-    // to look scattered rather than gridlike.
-    wire [5:0] deco_hash = deco_cx ^ {deco_cy[2:0], deco_cy[5:3]};
-
-    // Three mostly-disjoint residues of deco_hash so flowers/rocks/tall
-    // grass land in different cells instead of always stacking together.
-    wire flower_cell   = (deco_hash[3:0] == 4'd6);
-    wire rock_cell      = (deco_hash[3:0] == 4'd11);
-    wire tallgrass_cell = (deco_hash[3:0] == 4'd2) || (deco_hash[3:0] == 4'd9);
-
-    // ---- Flowers: a tiny 2x2 dot at the cell center, color varies by
-    // a couple of the hash bits (4 close wildflower tones).
-    wire flower_pixel = flower_cell &&
-                        (deco_lx >= 4'd7) && (deco_lx <= 4'd8) &&
-                        (deco_ly >= 4'd7) && (deco_ly <= 4'd8);
-    wire [1:0] flower_color_sel = deco_hash[5:4];
-
-    // ---- Rocks: small flattened oval (wider than tall, like a
-    // pebble), radius varies slightly (2 or 3px) using one more hash
-    // bit so they're not all identical.
-    wire signed [4:0] rock_dx = $signed({1'b0, deco_lx}) - 5'sd8;
-    wire signed [4:0] rock_dy = $signed({1'b0, deco_ly}) - 5'sd8;
-    wire [2:0] rock_r = deco_hash[5] ? 3'd3 : 3'd2;
-    wire rock_pixel = rock_cell &&
-                      ((rock_dx * rock_dx) + (rock_dy * rock_dy * 5'sd2) <=
-                       ({2'b0, rock_r} * {2'b0, rock_r} * 5'sd2));
-
-    // ---- Tall grass / ilalang: 3 thin vertical blades per clump,
-    // brighter than the base grass so the clump reads as a different
-    // texture instead of just "more grass speckle".
-    wire tallgrass_blade_col = (deco_lx == 4'd4) || (deco_lx == 4'd7) || (deco_lx == 4'd11);
-    wire tallgrass_blade_row = (deco_ly >= 4'd9) && (deco_ly <= 4'd14);
-    wire tallgrass_pixel = tallgrass_cell && tallgrass_blade_col && tallgrass_blade_row;
-
+    // Grass decorations (flowers, small rocks, tall-grass clumps) have
+    // all been removed -- replaced by more houses along the roadside
+    // instead.
     // Wrap a tree's base y-position (ty) forward by scroll_y, looping
     // back to the horizon once it would scroll past the bottom of the
     // screen. Keeps every tree cycling endlessly down the road instead
@@ -591,7 +521,7 @@ module render_static (
     // reads as one continuous row from one end of the road to the
     // other, on both sides, at every point in time.
     // ------------------------------------------------------------------
-    localparam NUM_TREES_SIDE      = 8;
+    localparam NUM_TREES_SIDE      = 5; // reduced from 8 -- see note below about compile stability
     localparam [9:0] TREE_Y_MIN    = 10'd120;
     localparam [9:0] TREE_Y_MAX    = 10'd480;
     localparam [9:0] TREE_Y_STEP   = (TREE_Y_MAX - TREE_Y_MIN) / NUM_TREES_SIDE; // 45
@@ -661,6 +591,369 @@ module render_static (
             if (tp_left[ti] == 3'b101 || tp_right[ti] == 3'b101) tree_trunk_shadow   = 1'b1;
         end
     end
+
+    // ------------------------------------------------------------------
+    // Ponds ("kolam"): a couple of irregular water blobs scattered WAY
+    // out past the treeline/house/windmill band on each side -- never
+    // round, never gridded with the road, trees, houses or windmill.
+    // Each pond is the UNION of two overlapping flattened blobs (same
+    // "dx^2 + 2*dy^2 <= 2*r^2" fast-ellipse trick the old boulder used,
+    // just applied twice at an offset) so the outline reads as a
+    // free-form puddle/pond shape instead of a circle. Its along-road
+    // row is picked by hashing the slot index across the WHOLE
+    // TREE_Y_MIN..TREE_Y_MAX range (an elaboration-time %, free since
+    // gi/SEED are compile-time constants -- no runtime divider), so
+    // ponds land at essentially arbitrary rows instead of an evenly
+    // spaced line, and POND_EXTRA_GAP pushes them well behind the
+    // house/windmill footprint so they don't crowd the road, the
+    // treeline, or the village band. Same wrap_ty/curve_shift_at
+    // perspective math as everything else, so they still scale and
+    // bend with the road as they scroll.
+    // ------------------------------------------------------------------
+    localparam NUM_PONDS_SIDE   = 2;
+    localparam [9:0] POND_EXTRA_GAP  = 10'd55; // clearance beyond the whole scenery band's own footprint
+    localparam [9:0] POND_BASE_R     = 10'd8;  // sizeable body of water, bigger than a boulder was --
+                                                 // kept low enough that BASE_R + max(dy>>SCALE_SHIFT) still
+                                                 // fits the 5-bit radius port pond_at takes (no wrap-around
+                                                 // at close range)
+    localparam       POND_SCALE_SHIFT = TREE_SCALE_SHIFT; // grows with distance like everything else
+
+    // ------------------------------------------------------------------
+    // Shape test: union of two flattened blobs (lobe 1 anchored at
+    // cx,cy; lobe 2 offset by dx2,dy2 with its own smaller radius r2)
+    // so the combined silhouette is an irregular kidney/puddle outline
+    // instead of a plain circle. Each lobe uses the same widened-product
+    // idiom as the old boulder_at (adx/ady widened before squaring, so
+    // far-away pixels can't silently wrap the multiply). A thin "shore"
+    // ring (outer-but-not-inner on either lobe) frames the water same
+    // as the outline ring did for trees/boulders.
+    //
+    // Returns: 3'b001 = water lit, 3'b010 = water shadow,
+    //          3'b011 = shore/mud rim, 3'b000 = none
+    // ------------------------------------------------------------------
+    function [2:0] pond_at;
+        input [9:0] px, py;
+        input [9:0] cx, cy;          // lobe 1 center
+        input [4:0] r1;              // lobe 1 vertical half-extent
+        input signed [8:0] dx2, dy2; // lobe 2 offset from lobe 1 center
+        input [4:0] r2;              // lobe 2 vertical half-extent
+        reg signed [10:0] ddx1, ddy1, ddx2, ddy2;
+        reg   [10:0] adx1, ady1, adx2, ady2;
+        reg signed [10:0] cx2, cy2;
+        reg   [4:0]  shrink1, shrink2, inner_r1, inner_r2;
+        reg   [21:0] dist2_1, outer1, inner1, dist2_2, outer2, inner2;
+        reg          is_lit, in1, in1i, in2, in2i;
+        begin
+            cx2 = $signed({1'b0, cx}) + dx2;
+            cy2 = $signed({1'b0, cy}) + dy2;
+
+            ddx1 = $signed({1'b0, px}) - $signed({1'b0, cx});
+            ddy1 = $signed({1'b0, py}) - $signed({1'b0, cy});
+            adx1 = ddx1[10] ? (-ddx1) : ddx1;
+            ady1 = ddy1[10] ? (-ddy1) : ddy1;
+
+            ddx2 = $signed({1'b0, px}) - cx2;
+            ddy2 = $signed({1'b0, py}) - cy2;
+            adx2 = ddx2[10] ? (-ddx2) : ddx2;
+            ady2 = ddy2[10] ? (-ddy2) : ddy2;
+
+            is_lit = (px < cx);
+
+            shrink1 = (r1 >> 3); if (shrink1 < 5'd1) shrink1 = 5'd1;
+            inner_r1 = (r1 > shrink1) ? (r1 - shrink1) : 5'd0;
+            shrink2 = (r2 >> 3); if (shrink2 < 5'd1) shrink2 = 5'd1;
+            inner_r2 = (r2 > shrink2) ? (r2 - shrink2) : 5'd0;
+
+            dist2_1 = ({11'd0, adx1} * {11'd0, adx1}) + (({11'd0, ady1} * {11'd0, ady1}) <<< 1);
+            outer1  = ({11'd0, r1}       * {11'd0, r1})       <<< 1;
+            inner1  = ({11'd0, inner_r1} * {11'd0, inner_r1}) <<< 1;
+
+            dist2_2 = ({11'd0, adx2} * {11'd0, adx2}) + (({11'd0, ady2} * {11'd0, ady2}) <<< 1);
+            outer2  = ({11'd0, r2}       * {11'd0, r2})       <<< 1;
+            inner2  = ({11'd0, inner_r2} * {11'd0, inner_r2}) <<< 1;
+
+            in1  = dist2_1 <= outer1;
+            in1i = dist2_1 <= inner1;
+            in2  = dist2_2 <= outer2;
+            in2i = dist2_2 <= inner2;
+
+            if (in1i || in2i)
+                pond_at = is_lit ? 3'b001 : 3'b010; // water lit/shadow
+            else if (in1 || in2)
+                pond_at = 3'b011; // shore rim
+            else
+                pond_at = 3'b000;
+        end
+    endfunction
+
+    wire [2:0] pnd_left  [0:NUM_PONDS_SIDE-1];
+    wire [2:0] pnd_right [0:NUM_PONDS_SIDE-1];
+
+    generate
+        for (gi = 0; gi < NUM_PONDS_SIDE; gi = gi + 1) begin : gen_left_pond
+            localparam [15:0] SEED     = (gi * 16'd28657) + 16'd9973;
+            localparam [9:0]  Y_JIT    = SEED % (TREE_Y_MAX - TREE_Y_MIN); // scatter across the WHOLE depth range, not a fixed grid row
+            localparam [9:0]  GAP_JIT  = {6'd0, SEED[9:6]} << 2;          // 0..60 px extra depth jitter
+            localparam signed LOBE_SX  = SEED[10] ? -1 : 1;
+            localparam signed LOBE_SY  = SEED[11] ? -1 : 1;
+            localparam [9:0]  base_py  = TREE_Y_MIN + Y_JIT;
+
+            wire [9:0] this_py    = wrap_ty(base_py, scroll_y);
+            wire [9:0] this_dy    = this_py - TREE_Y_MIN;
+            wire [9:0] this_r     = POND_BASE_R + (this_dy >> POND_SCALE_SHIFT);
+            wire [9:0] this_r2    = (this_r >> 1) + (this_r >> 2); // smaller second lobe, ~0.75x
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            wire [9:0] this_reach = this_r + (this_r >> 1); // flattened blob reaches ~1.5x its r horizontally
+
+            wire signed [8:0] this_dx2 = LOBE_SX * $signed({3'd0, this_r[5:0]});
+            wire signed [8:0] this_dy2 = LOBE_SY * $signed({3'd0, this_r2[5:0]});
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_px = this_center - this_rhalf - TREE_GAP - SCEN_BASE_GAP - POND_EXTRA_GAP - GAP_JIT - this_reach;
+
+            assign pnd_left[gi] = pond_at(x, y, this_px, this_py, this_r[4:0], this_dx2, this_dy2, this_r2[4:0]);
+        end
+
+        for (gi = 0; gi < NUM_PONDS_SIDE; gi = gi + 1) begin : gen_right_pond
+            localparam [15:0] SEED     = (gi * 16'd28657) + 16'd41221;
+            localparam [9:0]  Y_JIT    = SEED % (TREE_Y_MAX - TREE_Y_MIN);
+            localparam [9:0]  GAP_JIT  = {6'd0, SEED[9:6]} << 2;
+            localparam signed LOBE_SX  = SEED[10] ? -1 : 1;
+            localparam signed LOBE_SY  = SEED[11] ? -1 : 1;
+            localparam [9:0]  base_py  = TREE_Y_MIN + Y_JIT;
+
+            wire [9:0] this_py    = wrap_ty(base_py, scroll_y);
+            wire [9:0] this_dy    = this_py - TREE_Y_MIN;
+            wire [9:0] this_r     = POND_BASE_R + (this_dy >> POND_SCALE_SHIFT);
+            wire [9:0] this_r2    = (this_r >> 1) + (this_r >> 2);
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            wire [9:0] this_reach = this_r + (this_r >> 1);
+
+            wire signed [8:0] this_dx2 = LOBE_SX * $signed({3'd0, this_r[5:0]});
+            wire signed [8:0] this_dy2 = LOBE_SY * $signed({3'd0, this_r2[5:0]});
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_px = this_center + this_rhalf + TREE_GAP + SCEN_BASE_GAP + POND_EXTRA_GAP + GAP_JIT + this_reach;
+
+            assign pnd_right[gi] = pond_at(x, y, this_px, this_py, this_r[4:0], this_dx2, this_dy2, this_r2[4:0]);
+        end
+    endgenerate
+
+    // Same reduction idiom as the treeline above.
+    reg pond_water_lit, pond_water_shadow, pond_shore;
+    integer ri;
+    always @(*) begin
+        pond_water_lit    = 1'b0;
+        pond_water_shadow = 1'b0;
+        pond_shore        = 1'b0;
+        for (ri = 0; ri < NUM_PONDS_SIDE; ri = ri + 1) begin
+            if (pnd_left[ri] == 3'b001 || pnd_right[ri] == 3'b001) pond_water_lit    = 1'b1;
+            if (pnd_left[ri] == 3'b010 || pnd_right[ri] == 3'b010) pond_water_shadow = 1'b1;
+            if (pnd_left[ri] == 3'b011 || pnd_right[ri] == 3'b011) pond_shore        = 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Pond shimmer: the water was previously a flat lit/shadow blob with
+    // no motion at all. This adds a handful of bright glints that drift
+    // slowly across the surface -- a diagonal hash of (x,y) offset by a
+    // slowly-incrementing phase, so the pattern itself slides sideways
+    // over time instead of sitting still. Cheap: just adds and a mask,
+    // same idiom as asphalt_fleck/grass_speck elsewhere in this file.
+    // ------------------------------------------------------------------
+    localparam [7:0] SHIMMER_PERIOD_DIV = 8'd10; // frames between each shimmer step -- bigger = slower drift
+
+    reg [7:0] shimmer_phase;
+    reg [7:0] shimmer_counter;
+    initial shimmer_phase   = 8'd0;
+    initial shimmer_counter = 8'd0;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            shimmer_phase   <= 8'd0;
+            shimmer_counter <= 8'd0;
+        end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin
+            if (shimmer_counter >= SHIMMER_PERIOD_DIV - 8'd1) begin
+                shimmer_counter <= 8'd0;
+                shimmer_phase   <= shimmer_phase + 8'd1;
+            end else begin
+                shimmer_counter <= shimmer_counter + 8'd1;
+            end
+        end
+    end
+
+    wire [4:0] shimmer_val  = (x[2:0] + y[2:0] + shimmer_phase[4:0]) & 5'h1F;
+    wire       pond_shimmer = pond_water_lit && (shimmer_val < 5'd3);
+
+    // ------------------------------------------------------------------
+    // A person standing in their yard near the house (head, torso, arms,
+    // legs) -- was a scarecrow figure before; same slot/positioning
+    // system below is reused as-is (constants keep their SCARECROW_*
+    // names for that reason), only the shape+colors actually drawn
+    // have changed.
+    //
+    // NOTE: this used to run on the exact same step cadence as the
+    // house/windmill village band (both stepping by 40px, both starting
+    // from the same base phase) -- so an instance here and a scenery
+    // instance were very often sitting at almost the same depth AND the
+    // same side, i.e. permanently locked together ("numpuk"). Fixed by
+    // giving this its own step size (based on its own instance count,
+    // same idiom every other scenery system here already uses) and a
+    // non-half phase offset -- 180 and 40 don't share a small common
+    // period, so the two systems now continuously drift in and out of
+    // phase with each other instead of staying glued to the same spot.
+    // ------------------------------------------------------------------
+    localparam NUM_SCARECROWS_SIDE = 2;
+    localparam [9:0] SCARECROW_BASE_H  = 10'd10; // overall height at the horizon
+    localparam       SCARECROW_SCALE_SHIFT = 4;
+    // Self-contained step/gap constants (deliberately NOT reusing
+    // SCEN_Y_STEP/SCEN_BASE_GAP -- those belong to the house/windmill
+    // village band declared further down in this file, so referencing
+    // them here would be a forward reference to a localparam that
+    // doesn't exist yet at this point).
+    localparam [9:0] SCARECROW_Y_STEP    = (TREE_Y_MAX - TREE_Y_MIN) / NUM_SCARECROWS_SIDE; // own cadence, not the village band's
+    localparam [9:0] SCARECROW_PHASE_OFF = (SCARECROW_Y_STEP >> 2) + 10'd15; // decorrelating nudge, deliberately not a clean half-step
+    localparam [9:0] SCARECROW_BASE_GAP  = 10'd22; // baseline extra gap beyond the treeline
+    localparam [9:0] SCARECROW_RIGHT_OFF = SCARECROW_Y_STEP >> 1; // stagger left vs right side, same idiom as everything else
+
+    // ------------------------------------------------------------------
+    // Shape test: a real standing person -- head (with a small hair
+    // cap), torso, two arms hanging at the sides, two legs. Same
+    // signed-difference/abs idiom used throughout this file for every
+    // other silhouette test. The head uses a proper circular distance
+    // test (not the cheap Manhattan-diamond some other shapes use)
+    // since it's small enough that a diamond would read as an obvious
+    // non-circle at this scale.
+    //
+    // Note: like every other _at function here, this runs across the
+    // WHOLE screen every pixel, so the head's distance-squared compare
+    // widens its multiply past the natural operand width -- otherwise
+    // it silently wraps for pixels far from the person, the same class
+    // of bug that caused the bonus star's stray-pixel glitch fixed
+    // earlier.
+    //
+    // Returns: 0 = none, 1 = legs, 2 = torso, 3 = arms, 4 = head (skin), 5 = hair
+    // ------------------------------------------------------------------
+    function [2:0] person_at;
+        input [9:0] px, py;
+        input [9:0] cx, cy;  // cx = center x, cy = ground y (feet)
+        input [5:0] h;        // overall height
+        reg  [9:0] leg_h, torso_h, head_r;
+        reg  [9:0] leg_w, leg_gap, torso_hw, arm_w, arm_gap, arm_len;
+        reg  [9:0] leg_top, torso_top, head_cy;
+        reg signed [10:0] ddx, ddy;
+        reg  [10:0] adx, ady;
+        reg  [21:0] dist2, r2;
+        begin
+            head_r  = {4'd0, (h >> 2)}; if (head_r < 10'd3) head_r = 10'd3;
+            leg_h   = {4'd0, (h >> 1)};
+            torso_h = ({4'd0, h} > (leg_h + (head_r << 1))) ? ({4'd0, h} - leg_h - (head_r << 1)) : 10'd2;
+
+            leg_w    = {5'd0, (h >> 4)}; if (leg_w < 10'd1) leg_w = 10'd1;
+            leg_gap  = 10'd1; // small gap between the two legs
+            torso_hw = (leg_w <<< 1) + leg_gap; // as wide as both legs plus the gap between them
+            arm_w    = leg_w;
+            arm_gap  = 10'd1; // small gap between torso side and arm
+            arm_len  = torso_h - (torso_h >> 3);
+
+            leg_top   = cy - leg_h;
+            torso_top = leg_top - torso_h;
+            head_cy   = torso_top - head_r;
+
+            ddx = $signed({1'b0, px}) - $signed({1'b0, cx});
+            ddy = $signed({1'b0, py}) - $signed({1'b0, head_cy});
+            adx = ddx[10] ? (-ddx) : ddx;
+            ady = ddy[10] ? (-ddy) : ddy;
+
+            dist2 = ({11'd0, adx} * {11'd0, adx}) + ({11'd0, ady} * {11'd0, ady});
+            r2    = {11'd0, head_r} * {11'd0, head_r};
+
+            if ((py >= leg_top) && (py <= cy) &&
+                (((px >= cx - leg_gap - leg_w) && (px <= cx - leg_gap)) ||
+                 ((px >= cx + leg_gap)         && (px <= cx + leg_gap + leg_w))))
+                person_at = 3'd1; // legs
+            else if ((py >= torso_top) && (py <= leg_top) && (px >= cx - torso_hw) && (px <= cx + torso_hw))
+                person_at = 3'd2; // torso
+            else if ((py >= torso_top) && (py <= torso_top + arm_len) &&
+                     (((px >= cx - torso_hw - arm_gap - arm_w) && (px <= cx - torso_hw - arm_gap)) ||
+                      ((px >= cx + torso_hw + arm_gap)         && (px <= cx + torso_hw + arm_gap + arm_w))))
+                person_at = 3'd3; // arms
+            else if (dist2 <= r2)
+                person_at = (ddy <= -({1'b0, head_r} >>> 1)) ? 3'd5 : 3'd4; // hair (upper part) vs skin/face
+            else
+                person_at = 3'd0;
+        end
+    endfunction
+
+    wire [2:0] scr_left  [0:NUM_SCARECROWS_SIDE-1];
+    wire [2:0] scr_right [0:NUM_SCARECROWS_SIDE-1];
+
+    generate
+        for (gi = 0; gi < NUM_SCARECROWS_SIDE; gi = gi + 1) begin : gen_left_scarecrow
+            localparam [15:0] SEED    = (gi * 16'd19661) + 16'd5081;
+            localparam [9:0]  PHASE_JIT = {6'd0, SEED[6:3]};
+            localparam [9:0]  GAP_JIT = {6'd0, SEED[13:10]} << 1;
+            localparam [9:0]  base_py = TREE_Y_MIN + (SCARECROW_Y_STEP >> 1) + SCARECROW_PHASE_OFF + gi * SCARECROW_Y_STEP + PHASE_JIT;
+
+            wire [9:0] this_py    = wrap_ty(base_py, scroll_y);
+            wire [9:0] this_dy    = this_py - TREE_Y_MIN;
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            wire [9:0] this_h     = SCARECROW_BASE_H + (this_dy >> SCARECROW_SCALE_SHIFT);
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_px = this_center - this_rhalf - TREE_GAP - SCARECROW_BASE_GAP - GAP_JIT - (this_h >> 1);
+
+            assign scr_left[gi] = person_at(x, y, this_px, this_py, this_h[5:0]);
+        end
+
+        for (gi = 0; gi < NUM_SCARECROWS_SIDE; gi = gi + 1) begin : gen_right_scarecrow
+            localparam [15:0] SEED    = (gi * 16'd19661) + 16'd37423;
+            localparam [9:0]  PHASE_JIT = {6'd0, SEED[6:3]};
+            localparam [9:0]  GAP_JIT = {6'd0, SEED[13:10]} << 1;
+            localparam [9:0]  base_py = TREE_Y_MIN + (SCARECROW_Y_STEP >> 1) + SCARECROW_PHASE_OFF + SCARECROW_RIGHT_OFF + gi * SCARECROW_Y_STEP + PHASE_JIT;
+
+            wire [9:0] this_py    = wrap_ty(base_py, scroll_y);
+            wire [9:0] this_dy    = this_py - TREE_Y_MIN;
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            wire [9:0] this_h     = SCARECROW_BASE_H + (this_dy >> SCARECROW_SCALE_SHIFT);
+
+            wire signed [13:0] this_cshift = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_px = this_center + this_rhalf + TREE_GAP + SCARECROW_BASE_GAP + GAP_JIT + (this_h >> 1);
+
+            assign scr_right[gi] = person_at(x, y, this_px, this_py, this_h[5:0]);
+        end
+    endgenerate
+
+    // Same reduction idiom as everything else above.
+    reg person_legs, person_torso, person_arms, person_head, person_hair;
+    integer pi;
+    always @(*) begin
+        person_legs  = 1'b0;
+        person_torso = 1'b0;
+        person_arms  = 1'b0;
+        person_head  = 1'b0;
+        person_hair  = 1'b0;
+        for (pi = 0; pi < NUM_SCARECROWS_SIDE; pi = pi + 1) begin
+            if (scr_left[pi] == 3'd1 || scr_right[pi] == 3'd1) person_legs  = 1'b1;
+            if (scr_left[pi] == 3'd2 || scr_right[pi] == 3'd2) person_torso = 1'b1;
+            if (scr_left[pi] == 3'd3 || scr_right[pi] == 3'd3) person_arms  = 1'b1;
+            if (scr_left[pi] == 3'd4 || scr_right[pi] == 3'd4) person_head  = 1'b1;
+            if (scr_left[pi] == 3'd5 || scr_right[pi] == 3'd5) person_hair  = 1'b1;
+        end
+    end
+
 
     // ------------------------------------------------------------------
     // Windmill: a tall thin tower with 4 blades spinning around a hub
@@ -761,7 +1054,7 @@ module render_static (
     // whole village still bends smoothly with the road and keeps
     // scrolling forever.
     // ------------------------------------------------------------------
-    localparam NUM_SCENERY_SIDE        = 9;
+    localparam NUM_SCENERY_SIDE        = 5; // reduced from 9 -- see note below about compile stability
     localparam [9:0] SCEN_Y_STEP       = (TREE_Y_MAX - TREE_Y_MIN) / NUM_SCENERY_SIDE; // 40
     localparam [9:0] SCEN_RIGHT_OFF    = SCEN_Y_STEP >> 1; // stagger right side vs left
     localparam [9:0] SCEN_BASE_GAP     = 10'd22; // baseline extra gap beyond the treeline
@@ -798,7 +1091,13 @@ module render_static (
 
             wire [9:0] this_house_half = HOUSE_BASE_HALF    + (this_dy >> HOUSE_SCALE_SHIFT);
             wire [9:0] this_wind_half  = WINDMILL_BASE_HALF + (this_dy >> WINDMILL_SCALE_SHIFT);
-            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_half;
+            // The windmill's actual visible footprint is its BLADE SWEEP,
+            // not just this_wind_half -- windmill_at is called below with
+            // a blade radius of (this_wind_half*2)+8, so that's what has
+            // to be reserved here too, or the blades reach back past the
+            // gap and swipe into the treeline.
+            wire [9:0] this_wind_blade_r = (this_wind_half <<< 1) + 10'd8;
+            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_blade_r;
 
             wire [9:0] this_sx = this_center - this_rhalf - TREE_GAP - SCEN_BASE_GAP - GAP_JIT - this_obj_half;
 
@@ -808,7 +1107,7 @@ module render_static (
                                            : 3'b000;
             assign wp_left[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
                                                 this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
-                                                (this_wind_half[4:0] <<< 1) + 5'd8, windmill_spin)
+                                                this_wind_blade_r[4:0], windmill_spin)
                                               : 3'b000;
         end
 
@@ -832,7 +1131,8 @@ module render_static (
 
             wire [9:0] this_house_half = HOUSE_BASE_HALF    + (this_dy >> HOUSE_SCALE_SHIFT);
             wire [9:0] this_wind_half  = WINDMILL_BASE_HALF + (this_dy >> WINDMILL_SCALE_SHIFT);
-            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_half;
+            wire [9:0] this_wind_blade_r = (this_wind_half <<< 1) + 10'd8;
+            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_blade_r;
 
             wire [9:0] this_sx = this_center + this_rhalf + TREE_GAP + SCEN_BASE_GAP + GAP_JIT + this_obj_half;
 
@@ -842,7 +1142,7 @@ module render_static (
                                             : 3'b000;
             assign wp_right[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
                                                 this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
-                                                (this_wind_half[4:0] <<< 1) + 5'd8, windmill_spin)
+                                                this_wind_blade_r[4:0], windmill_spin)
                                                : 3'b000;
         end
     endgenerate
@@ -1011,14 +1311,6 @@ module render_static (
                             (x >  road_right) &&
                             (x <= road_right + TROTOAR_WIDTH);
 
-    assign shoulder_left  = (y >= 10'd120) &&
-                             (x >= road_left - TROTOAR_WIDTH - SHOULDER_WIDTH) &&
-                             (x <  road_left - TROTOAR_WIDTH);
-
-    assign shoulder_right = (y >= 10'd120) &&
-                             (x >  road_right + TROTOAR_WIDTH) &&
-                             (x <= road_right + TROTOAR_WIDTH + SHOULDER_WIDTH);
-
     // Stripe pattern for the curb: toggles black/white every few rows
     // of world-scroll (anim_y), same "cheap XOR/bit-toggle" idiom used
     // for the dashed center line and asphalt speckle above, so the
@@ -1175,12 +1467,14 @@ localparam CAR_W = 10'd128;
     wire [13:0] rom_addr = ((y - CAR_Y) * CAR_W) + col_rel[9:0];
 
     // ------------------------------------------------------------------
-    // Obstacle (rintangan): a single procedural "barrier drum" that
-    // travels from just below the horizon down to the player's row,
-    // scaling up the same way the road itself widens with dy, then
-    // loops back to the horizon with a new random lane. Drawn as a
-    // colored box (same style family as the trees) instead of a photo
-    // sprite, so it needs no new ROM/image asset.
+    // Obstacle (rintangan): a vehicle -- randomly either a car or a
+    // motorcycle at each respawn -- that travels from just below the
+    // horizon down to the player's row, scaling up the same way the
+    // road itself widens with dy, then loops back to the horizon with
+    // a new random lane AND a freshly re-rolled vehicle type. Drawn as
+    // a colored silhouette viewed from behind (same style family as
+    // the trees/houses) instead of a photo sprite, so it needs no new
+    // ROM/image asset.
     // ------------------------------------------------------------------
     localparam OBS_Y_START      = 10'd130;          // spawn row, just past the horizon
     localparam OBS_Y_END        = CAR_Y + CAR_H;     // once it reaches here it has "passed" the player
@@ -1229,6 +1523,7 @@ localparam CAR_W = 10'd128;
 
     reg [9:0] obstacle_y;
     reg [1:0] obstacle_lane;   // 0 = kiri, 1 = tengah, 2 = kanan (3 tidak dipakai)
+    reg       obstacle_is_car; // 0 = motor, 1 = mobil -- re-rolled at every respawn
     reg [7:0] obstacle_rand;   // 8-bit LFSR, sampled at respawn for a pseudo-random lane
     reg       obstacle_overlap_prev; // overlap state one frame ago, for edge detection
 
@@ -1276,6 +1571,7 @@ localparam CAR_W = 10'd128;
 
     initial obstacle_y            = OBS_Y_START;
     initial obstacle_lane         = 2'd1;
+    initial obstacle_is_car       = 1'b1;
     initial obstacle_rand         = 8'hA5; // must be non-zero for the LFSR to run
     initial obstacle_overlap_prev = 1'b0;
     initial score                 = 16'd0;
@@ -1301,6 +1597,11 @@ localparam CAR_W = 10'd128;
     wire [1:0] next_lane_raw = obstacle_rand[1:0] ^ obstacle_rand[6:5];
     wire [1:0] next_lane     = (next_lane_raw == 2'd3) ? 2'd1 : next_lane_raw;
 
+    // Random vehicle type for the next spawn -- a different LFSR bit
+    // than the lane picker above uses, so the two choices don't end up
+    // correlated with each other.
+    wire next_is_car = obstacle_rand[7] ^ obstacle_rand[2];
+
     // Same perspective math the road itself uses (curve_base/curved
     // center/half-width), just evaluated at the obstacle's OWN distance
     // (dy_obs) instead of the current scanline's dy -- it's a flat box,
@@ -1320,7 +1621,11 @@ localparam CAR_W = 10'd128;
     wire signed [10:0] obstacle_x_signed = center_x_obs_signed + lane_offset;
     wire [9:0] obstacle_x = clamp_center_x(obstacle_x_signed, 10'd25); // 25 > OBS_MAX_HALF_W, safe margin
 
-    wire [9:0] obs_half_w = OBS_BASE_HALF_W + (dy_obs >> OBS_SCALE_SHIFT);
+    // Motorcycle gets a narrower box than a car -- it's a visibly
+    // narrower vehicle, so a narrower hitbox to match is fair.
+    wire [9:0] obs_half_w = obstacle_is_car
+        ? (OBS_BASE_HALF_W + (dy_obs >> OBS_SCALE_SHIFT) + 10'd2)
+        : (((OBS_BASE_HALF_W + (dy_obs >> OBS_SCALE_SHIFT)) >> 1) + 10'd1);
     wire [9:0] obs_half_h = OBS_BASE_HALF_H + (dy_obs >> OBS_SCALE_SHIFT);
 
     wire signed [10:0] obs_col_rel = $signed({1'b0, x}) - $signed({1'b0, obstacle_x});
@@ -1329,17 +1634,49 @@ localparam CAR_W = 10'd128;
     wire is_obstacle_area = (obs_col_rel >= -$signed({1'b0, obs_half_w})) && (obs_col_rel <= $signed({1'b0, obs_half_w})) &&
                              (obs_row_rel >= -$signed({1'b0, obs_half_h})) && (obs_row_rel <= $signed({1'b0, obs_half_h}));
 
-    // Warning-drum look: dark border, a black stripe through the
-    // middle third, orange everywhere else -- reads clearly as "hazard"
-    // regardless of the scene's color palette.
-    wire [9:0] obs_border_px  = 10'd2;
-    wire obs_is_border = (obs_col_rel <= -$signed({1'b0, obs_half_w}) + $signed({1'b0, obs_border_px})) ||
-                          (obs_col_rel >=  $signed({1'b0, obs_half_w}) - $signed({1'b0, obs_border_px})) ||
-                          (obs_row_rel <= -$signed({1'b0, obs_half_h}) + $signed({1'b0, obs_border_px})) ||
-                          (obs_row_rel >=  $signed({1'b0, obs_half_h}) - $signed({1'b0, obs_border_px}));
+    // ------------------------------------------------------------------
+    // Vehicle silhouette, viewed from behind (like a car or motorbike
+    // ahead of the player on the road). All region tests below reuse
+    // obs_col_rel/obs_row_rel (plain signed subtractions, already
+    // computed above) -- no multiplication needed, so there's no width-
+    // truncation risk here the way there was for the circular shapes
+    // elsewhere in this file (star/boulder/person).
+    //
+    // Car: body fill, a darker rear-window band across the top third,
+    // and two bright taillights at the bottom corners.
+    // Motorcycle: a small helmet band at the very top, body/seat below
+    // it, and a single centered taillight at the bottom.
+    // ------------------------------------------------------------------
+    wire signed [10:0] obs_top   = -$signed({1'b0, obs_half_h});
+    wire signed [10:0] obs_bot   =  $signed({1'b0, obs_half_h});
+    wire signed [10:0] obs_left  = -$signed({1'b0, obs_half_w});
+    wire signed [10:0] obs_right =  $signed({1'b0, obs_half_w});
 
-    wire [9:0] obs_mid_band = obs_half_h >> 2;
-    wire obs_is_stripe = (obs_row_rel >= -$signed({1'b0, obs_mid_band})) && (obs_row_rel <= $signed({1'b0, obs_mid_band}));
+    wire [9:0] obs_band_h = (obs_half_h > 10'd1) ? (obs_half_h >> 1) : 10'd1; // ~half the box height
+
+    // Car-only regions
+    wire obs_car_window = obstacle_is_car &&
+                          (obs_row_rel >= obs_top) &&
+                          (obs_row_rel <= obs_top + $signed({1'b0, obs_band_h}));
+
+    wire [9:0] obs_car_light_w = (obs_half_w > 10'd3) ? (obs_half_w >> 2) : 10'd1;
+    wire obs_car_taillight = obstacle_is_car &&
+                             (obs_row_rel >= obs_bot - $signed({1'b0, obs_band_h})) &&
+                             (obs_row_rel <= obs_bot) &&
+                             (((obs_col_rel >= obs_left) && (obs_col_rel <= obs_left + $signed({1'b0, obs_car_light_w}))) ||
+                              ((obs_col_rel <= obs_right) && (obs_col_rel >= obs_right - $signed({1'b0, obs_car_light_w}))));
+
+    // Motorcycle-only regions
+    wire obs_moto_helmet = !obstacle_is_car &&
+                           (obs_row_rel >= obs_top) &&
+                           (obs_row_rel <= obs_top + $signed({1'b0, obs_band_h}) - 11'sd1);
+
+    wire [9:0] obs_moto_light_w = (obs_half_w > 10'd1) ? (obs_half_w >> 1) : 10'd1;
+    wire obs_moto_taillight = !obstacle_is_car &&
+                              (obs_row_rel >= obs_bot - 11'sd1) &&
+                              (obs_row_rel <= obs_bot) &&
+                              (obs_col_rel >= -$signed({1'b0, obs_moto_light_w})) &&
+                              (obs_col_rel <=  $signed({1'b0, obs_moto_light_w}));
 
     // ------------------------------------------------------------------
     // Bonus star pickup: exactly the same perspective/lane math the
@@ -1379,6 +1716,18 @@ localparam CAR_W = 10'd128;
         reg signed [10:0] ddx, ddy;
         reg [10:0] adx, ady;
         reg [10:0] thick, rr;
+        reg [21:0] lhs_v, rhs_v, lhs_h, rhs_h; // widened products -- adx/ady can be up
+                                                 // to ~640 (this runs for every pixel on
+                                                 // screen, not just a local window around
+                                                 // the star), and a plain 11-bit*11-bit
+                                                 // self-determined multiply silently wraps
+                                                 // around for inputs that large. That wrap
+                                                 // could accidentally satisfy the <=
+                                                 // comparison far from the real star,
+                                                 // painting stray sparkle pixels wherever it
+                                                 // happened to wrap low -- exactly the
+                                                 // "gambar gajelas" glitch. 22 bits is more
+                                                 // than enough (max product ~640*31 needs 15).
         reg core, body, vspike, hspike;
         begin
             ddx = $signed({1'b0, px}) - $signed({1'b0, sx});
@@ -1391,8 +1740,14 @@ localparam CAR_W = 10'd128;
 
             core   = (adx + ady) <= (rr >> 2);
             body   = (adx + ady) <= (rr >> 1);
-            vspike = (ady <= rr) && (adx * rr <= thick * (rr - ady));
-            hspike = (adx <= rr) && (ady * rr <= thick * (rr - adx));
+
+            lhs_v = {11'd0, adx}   * {11'd0, rr};
+            rhs_v = {11'd0, thick} * {11'd0, (ady <= rr) ? (rr - ady) : 11'd0};
+            lhs_h = {11'd0, ady}   * {11'd0, rr};
+            rhs_h = {11'd0, thick} * {11'd0, (adx <= rr) ? (rr - adx) : 11'd0};
+
+            vspike = (ady <= rr) && (lhs_v <= rhs_v);
+            hspike = (adx <= rr) && (lhs_h <= rhs_h);
 
             if (core)
                 star_at = 2'd2;
@@ -1489,6 +1844,7 @@ localparam CAR_W = 10'd128;
         if (reset) begin
             obstacle_y            <= OBS_Y_START;
             obstacle_lane         <= 2'd1;
+            obstacle_is_car       <= 1'b1;
             obstacle_rand         <= 8'hA5;   // non-zero seed -- an all-zero LFSR would stay stuck at 0 forever
             obstacle_overlap_prev <= 1'b0;
             collision             <= 1'b0;
@@ -1541,6 +1897,7 @@ localparam CAR_W = 10'd128;
                 if (collision_edge || obstacle_reached_end) begin
                     obstacle_y            <= OBS_Y_START;
                     obstacle_lane         <= next_lane;
+                    obstacle_is_car       <= next_is_car;
                     obstacle_overlap_prev <= 1'b0;
                 end else begin
                     obstacle_y <= obstacle_y + OBSTACLE_SPEED;
@@ -2069,18 +2426,40 @@ localparam CAR_W = 10'd128;
      end
 
         else if (is_obstacle_area) begin
-            if (obs_is_border) begin
-                red   = 8'd35;
-                green = 8'd25;
-                blue  = 8'd20;
-            end else if (obs_is_stripe) begin
-                red   = 8'd20;
-                green = 8'd20;
-                blue  = 8'd20;
+            if (obstacle_is_car) begin
+                if (obs_car_window) begin
+                    // Rear windshield -- dark glass.
+                    red   = 8'd35;
+                    green = 8'd40;
+                    blue  = 8'd50;
+                end else if (obs_car_taillight) begin
+                    // Bright taillights.
+                    red   = 8'd250;
+                    green = 8'd40;
+                    blue  = 8'd35;
+                end else begin
+                    // Car body.
+                    red   = 8'd175;
+                    green = 8'd35;
+                    blue  = 8'd35;
+                end
             end else begin
-                red   = 8'd235;
-                green = 8'd120;
-                blue  = 8'd35;
+                if (obs_moto_helmet) begin
+                    // Rider's helmet.
+                    red   = 8'd25;
+                    green = 8'd25;
+                    blue  = 8'd30;
+                end else if (obs_moto_taillight) begin
+                    // Taillight.
+                    red   = 8'd250;
+                    green = 8'd40;
+                    blue  = 8'd35;
+                end else begin
+                    // Body/seat.
+                    red   = 8'd55;
+                    green = 8'd60;
+                    blue  = 8'd70;
+                end
             end
         end
 
@@ -2155,14 +2534,6 @@ localparam CAR_W = 10'd128;
                 end
             end
 
-            else if (shoulder_left || shoulder_right) begin
-                // Dusty mauve gravel, pulled toward the mountains' blue
-                // undertone rather than a plain warm brown.
-                terrain_r = 8'd140;
-                terrain_g = 8'd116;
-                terrain_b = 8'd148;
-            end
-
             else if (tree_canopy_outline) begin
                 // Thin dark rim around the canopy so it reads as a
                 // distinct rounded shape instead of a flat blob melting
@@ -2202,6 +2573,74 @@ localparam CAR_W = 10'd128;
                 terrain_r = 8'd72;
                 terrain_g = 8'd54;
                 terrain_b = 8'd68;
+            end
+
+            else if (pond_shore) begin
+                // Muddy shore rim ringing the pond -- keeps the water
+                // reading as a distinct irregular puddle shape instead
+                // of melting straight into the grass.
+                terrain_r = 8'd120;
+                terrain_g = 8'd96;
+                terrain_b = 8'd64;
+            end
+
+            else if (pond_water_lit) begin
+                if (pond_shimmer) begin
+                    // Bright drifting glint -- the water's only source
+                    // of motion/life, since the shape itself is static.
+                    terrain_r = 8'd170;
+                    terrain_g = 8'd225;
+                    terrain_b = 8'd235;
+                end else begin
+                    // Lit face (fixed "light from the left"): brighter
+                    // reflective teal-blue.
+                    terrain_r = 8'd70;
+                    terrain_g = 8'd150;
+                    terrain_b = 8'd180;
+                end
+            end
+
+            else if (pond_water_shadow) begin
+                // Shadow face: deeper, darker water -- gives the pond
+                // some depth instead of a flat blob of blue.
+                terrain_r = 8'd35;
+                terrain_g = 8'd90;
+                terrain_b = 8'd120;
+            end
+
+            else if (person_torso) begin
+                // Shirt.
+                terrain_r = 8'd60;
+                terrain_g = 8'd90;
+                terrain_b = 8'd150;
+            end
+
+            else if (person_legs) begin
+                // Pants.
+                terrain_r = 8'd55;
+                terrain_g = 8'd55;
+                terrain_b = 8'd62;
+            end
+
+            else if (person_arms) begin
+                // Bare arms -- same skin tone as the head/face.
+                terrain_r = 8'd210;
+                terrain_g = 8'd165;
+                terrain_b = 8'd130;
+            end
+
+            else if (person_head) begin
+                // Face/skin.
+                terrain_r = 8'd210;
+                terrain_g = 8'd165;
+                terrain_b = 8'd130;
+            end
+
+            else if (person_hair) begin
+                // Dark hair cap.
+                terrain_r = 8'd40;
+                terrain_g = 8'd30;
+                terrain_b = 8'd26;
             end
 
             else if (house_roof) begin
@@ -2265,31 +2704,6 @@ localparam CAR_W = 10'd128;
                 terrain_r = 8'd132;
                 terrain_g = 8'd122;
                 terrain_b = 8'd112;
-            end
-
-            else if (flower_pixel) begin
-                // 4 close wildflower tones -- yellow, pink, white, pale lavender.
-                case (flower_color_sel)
-                    2'b00: begin terrain_r = 8'd240; terrain_g = 8'd210; terrain_b = 8'd90;  end // yellow
-                    2'b01: begin terrain_r = 8'd235; terrain_g = 8'd150; terrain_b = 8'd190; end // pink
-                    2'b10: begin terrain_r = 8'd245; terrain_g = 8'd245; terrain_b = 8'd240; end // white
-                    default: begin terrain_r = 8'd200; terrain_g = 8'd170; terrain_b = 8'd230; end // pale lavender
-                endcase
-            end
-
-            else if (rock_pixel) begin
-                // Cool grey pebble, slightly bluish to match the dusk palette.
-                terrain_r = 8'd120;
-                terrain_g = 8'd118;
-                terrain_b = 8'd128;
-            end
-
-            else if (tallgrass_pixel) begin
-                // Brighter than the base grass shades below, so the
-                // blades pop as a distinct texture rather than blending in.
-                terrain_r = 8'd90;
-                terrain_g = 8'd160;
-                terrain_b = 8'd150;
             end
 
             else begin
