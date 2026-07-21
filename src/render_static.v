@@ -64,7 +64,11 @@ module render_static (
     // obstacle_speed_bonus is declared further down (next to
     // OBSTACLE_SPEED) but that's fine -- it's a plain wire, so the
     // forward reference resolves normally in Verilog.
-    wire [9:0] world_scroll_speed = SCROLL_SPEED + obstacle_speed_bonus;
+    // nitro_active (wire, dideklarasikan jauh di bawah dekat logika
+    // pickup) menambah +3 sementara saat power-up nitro sedang aktif --
+    // forward reference wire, idiom yang sama dengan obstacle_speed_bonus.
+    wire [9:0] world_scroll_speed = SCROLL_SPEED + obstacle_speed_bonus
+                                    + (nitro_active ? 10'd3 : 10'd0);
 
     // Road converges toward a narrow point at the horizon and widens
     // toward the camera. ROAD_HALF_FAR is the half-width right at the
@@ -159,6 +163,69 @@ module render_static (
     end
 
     // ------------------------------------------------------------------
+    // City/village district toggle: every ZONE_LENGTH px of world
+    // travel, the roadside scenery generator (further below) swaps
+    // between a rural village district (houses + windmills, grassy
+    // shoulder) and a city district (tall buildings + a minimarket,
+    // paved sidewalk shoulder). Same "once per frame" gating and
+    // world_scroll_speed rate as seg_dist above, so district changes
+    // keep perfect pace with the road/trees/obstacles instead of
+    // drifting out of sync with everything else that scrolls.
+    // ------------------------------------------------------------------
+    localparam [19:0] ZONE_LENGTH = 20'd2400; // px of travel per district
+
+    // 4 distrik yang berputar terus: 0 = desa (siang), 1 = kota (siang),
+    // 2 = pegunungan bersalju (terrain putih + pohon cemara), 3 = kota
+    // MALAM (langit gelap, jendela gedung menyala terang). zone_id[0]
+    // tetap berarti "sedang di kota", jadi SEMUA logika kota lama
+    // (gedung/minimarket/trotoar beton) tetap bekerja tanpa diubah --
+    // hanya pewarnaannya yang bercabang lewat in_snow_zone/in_night_zone.
+    reg  [19:0] zone_dist;
+    reg  [1:0]  zone_id;
+    reg  [1:0]  city_visit_count; // 0..2, dipakai siklus landmark (tiap 3 kunjungan kota)
+    reg         landmark_active;  // true = kunjungan kota kali ini memunculkan menara jam
+    reg  [2:0]  weather_cycle;    // counter pergantian zona -- dipakai jadwal hujan
+    initial zone_dist        = 20'd0;
+    initial zone_id          = 2'd0;
+    initial city_visit_count = 2'd0;
+    initial landmark_active  = 1'b0;
+    initial weather_cycle    = 3'd0;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            zone_dist        <= 20'd0;
+            zone_id          <= 2'd0;
+            city_visit_count <= 2'd0;
+            landmark_active  <= 1'b0;
+            weather_cycle    <= 3'd0;
+        end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin
+            if (zone_dist + world_scroll_speed >= ZONE_LENGTH) begin
+                zone_dist <= (zone_dist + world_scroll_speed) - ZONE_LENGTH;
+                zone_id   <= zone_id + 2'd1;   // wrap 0,1,2,3,0,... otomatis
+                weather_cycle <= weather_cycle + 3'd1; // wrap 0..7 otomatis
+                // Zona BERIKUTNYA adalah kota kalau zone_id sekarang genap
+                // (0->1 dan 2->3 sama-sama masuk kota). Hitung kunjungan
+                // kota di sini supaya landmark_active sudah final tepat
+                // saat kotanya mulai tergambar.
+                if (!zone_id[0]) begin
+                    landmark_active <= (city_visit_count == 2'd2); // tiap kunjungan kota ke-3
+                    city_visit_count <= (city_visit_count == 2'd2) ? 2'd0 : (city_visit_count + 2'd1);
+                end
+            end else begin
+                zone_dist <= zone_dist + world_scroll_speed;
+            end
+        end
+    end
+
+    wire in_city_zone  = zone_id[0];          // 1 & 3 = kota (siang / malam)
+    wire in_snow_zone  = (zone_id == 2'd2);   // pegunungan salju
+    wire in_night_zone = (zone_id == 2'd3);   // kota malam / neon
+
+    // Jadwal hujan: aktif di 2 dari 8 pergantian zona (tidak berurutan),
+    // jadi cuaca berubah berkala tanpa perlu RNG/logic baru yang berat.
+    wire rain_active = (weather_cycle == 3'd2) || (weather_cycle == 3'd5);
+
+    // ------------------------------------------------------------------
     // Clamps a curved center-x to whatever range keeps a box of the
     // given half-extent fully on screen (0..639). Used for the road
     // itself and for the obstacle, which does the same "bend sideways
@@ -175,16 +242,41 @@ module render_static (
                                     // silently overflow/wrap an 11-bit signed input before this
                                     // function even got a chance to clamp it
         input [9:0] half_extent;
-        reg signed [13:0] lo, hi;
+        reg signed [13:0] lo, hi, e, knee_out;
+        // Soft-knee width: instead of a hard cutoff the moment cx crosses
+        // lo/hi, we ease the slope down to 0 over HALF_KNEE*2 pixels.
+        // Without this, a sharp enough curve pushes cx past hi/lo for
+        // several rows near the horizon, and every one of those rows gets
+        // pinned to the exact same x -- a flat vertical "wall" -- while
+        // the rows just outside the clamp are still following the smooth
+        // arc. The instant jump from "still curving" to "perfectly flat"
+        // is what shows up on screen as a visible break/kink right at the
+        // sharpest part of the bend. The quadratic knee below matches
+        // both value AND slope at the knee's start (still tracks cx) and
+        // end (slope 0, same as full clamp), so the curve rounds off
+        // smoothly into its pinned max instead of snapping into it.
+        localparam signed HALF_KNEE = 14'sd32;
         begin
             lo = $signed({4'd0, half_extent});
             hi = 14'sd639 - $signed({4'd0, half_extent});
-            if (cx < lo)
-                clamp_center_x = lo[9:0];
-            else if (cx > hi)
-                clamp_center_x = hi[9:0];
-            else
+
+            if (cx > hi - HALF_KNEE) begin
+                e = cx - (hi - HALF_KNEE);
+                if (e >= (HALF_KNEE <<< 1))
+                    knee_out = hi;                      // fully pinned, same as before
+                else
+                    knee_out = cx - ((e * e) >>> 7);     // eases slope 1 -> 0
+                clamp_center_x = knee_out[9:0];
+            end else if (cx < lo + HALF_KNEE) begin
+                e = (lo + HALF_KNEE) - cx;
+                if (e >= (HALF_KNEE <<< 1))
+                    knee_out = lo;
+                else
+                    knee_out = cx + ((e * e) >>> 7);
+                clamp_center_x = knee_out[9:0];
+            end else begin
                 clamp_center_x = cx[9:0];
+            end
         end
     endfunction
 
@@ -416,11 +508,16 @@ module render_static (
         input [9:0] tx, ty;   // tree position: x center, y = ground/base
         input [4:0] cr;       // canopy radius
         input [4:0] tw, th;   // trunk width, trunk height
+        input       is_pine;  // 1 = pohon cemara (kerucut, dipakai zona salju)
         reg   [9:0] cy;       // canopy center y
         reg   [9:0] dx, dyv;
         reg   [19:0] dist2, r2, inner_r2;
         reg   [4:0] inner_cr;
         reg         is_lit;
+        // ---- khusus cemara: kerucut via cross-multiplication (trik yang
+        // sama dengan atap rumah/gunung -- tanpa pembagian) ----
+        reg   [9:0] pine_apex, pine_base, pine_h, pine_dyfa;
+        reg   [19:0] pine_lhs, pine_rhs_out, pine_rhs_in;
         begin
             cy   = ty - th - cr + 10'd3;  // canopy overlaps top of trunk a bit
             dx   = (px >= tx) ? (px - tx) : (tx - px);
@@ -433,7 +530,31 @@ module render_static (
 
             is_lit = (px < tx); // fixed "light from the left" for every tree
 
-            if (dist2 <= r2) begin
+            // Kerucut cemara: puncak lebih tinggi dari kanopi bulat
+            // (2*cr di atas alasnya) supaya siluetnya jelas beda; lebar
+            // setengah-alas = cr, mengecil linier ke satu titik di puncak.
+            pine_base = ty - {5'd0, th >> 1};
+            pine_apex = pine_base - ({5'd0, cr} << 1) - {5'd0, cr}; // tinggi kerucut = 3*cr
+            pine_h    = pine_base - pine_apex;
+            pine_dyfa = (py >= pine_apex) ? (py - pine_apex) : 10'd0;
+            pine_lhs     = {10'd0, dx} * {10'd0, pine_h};
+            pine_rhs_out = {15'd0, cr} * {10'd0, pine_dyfa};
+            pine_rhs_in  = {15'd0, inner_cr} * {10'd0, (pine_dyfa > 10'd2) ? (pine_dyfa - 10'd2) : 10'd0};
+
+            if (is_pine) begin
+                if ((py >= pine_apex) && (py <= pine_base) && (pine_lhs <= pine_rhs_out)) begin
+                    if (pine_lhs > pine_rhs_in)
+                        tree_at = 3'b011; // tepi kerucut -- dipakai sebagai "rim salju"
+                    else if (is_lit)
+                        tree_at = 3'b001; // sisi terang cemara
+                    else
+                        tree_at = 3'b010; // sisi bayangan cemara
+                end else if ((px >= tx - {5'd0, tw >> 1}) && (px <= tx + {5'd0, tw >> 1}) &&
+                             (py >= ty - {5'd0, th}) && (py <= ty)) begin
+                    tree_at = is_lit ? 3'b100 : 3'b101; // batang
+                end else
+                    tree_at = 3'b000;
+            end else if (dist2 <= r2) begin
                 if (dist2 > inner_r2)
                     tree_at = 3'b011; // thin outline ring
                 else if (is_lit)
@@ -550,7 +671,8 @@ module render_static (
             wire [9:0] this_tx = this_center - this_rhalf - TREE_GAP - this_half;
 
             assign tp_left[gi] = tree_at(x, y, this_tx, this_ty,
-                                          this_half[4:0], this_half[4:0] >> 1, this_half[4:0]);
+                                          this_half[4:0], this_half[4:0] >> 1, this_half[4:0],
+                                          in_snow_zone);
         end
 
         for (gi = 0; gi < NUM_TREES_SIDE; gi = gi + 1) begin : gen_right_tree
@@ -568,7 +690,8 @@ module render_static (
             wire [9:0] this_tx = this_center + this_rhalf + TREE_GAP + this_half;
 
             assign tp_right[gi] = tree_at(x, y, this_tx, this_ty,
-                                           this_half[4:0], this_half[4:0] >> 1, this_half[4:0]);
+                                           this_half[4:0], this_half[4:0] >> 1, this_half[4:0],
+                                           in_snow_zone);
         end
     endgenerate
 
@@ -752,10 +875,15 @@ module render_static (
         pond_water_lit    = 1'b0;
         pond_water_shadow = 1'b0;
         pond_shore        = 1'b0;
-        for (ri = 0; ri < NUM_PONDS_SIDE; ri = ri + 1) begin
-            if (pnd_left[ri] == 3'b001 || pnd_right[ri] == 3'b001) pond_water_lit    = 1'b1;
-            if (pnd_left[ri] == 3'b010 || pnd_right[ri] == 3'b010) pond_water_shadow = 1'b1;
-            if (pnd_left[ri] == 3'b011 || pnd_right[ri] == 3'b011) pond_shore        = 1'b1;
+        if (!in_city_zone) begin
+            // Ponds are a rural-district feature only -- skip them
+            // entirely while the city district is active so the
+            // sidewalk between buildings never sprouts a puddle.
+            for (ri = 0; ri < NUM_PONDS_SIDE; ri = ri + 1) begin
+                if (pnd_left[ri] == 3'b001 || pnd_right[ri] == 3'b001) pond_water_lit    = 1'b1;
+                if (pnd_left[ri] == 3'b010 || pnd_right[ri] == 3'b010) pond_water_shadow = 1'b1;
+                if (pnd_left[ri] == 3'b011 || pnd_right[ri] == 3'b011) pond_shore        = 1'b1;
+            end
         end
     end
 
@@ -1038,6 +1166,133 @@ module render_static (
     end
 
     // ------------------------------------------------------------------
+    // City building: a tall flat-roofed tower with a grid of small lit
+    // windows (cheap bit-slice grid, same idiom as asphalt_fleck/
+    // grass_speck above -- no loops needed). A thin parapet ledge caps
+    // the roof instead of the house's pitched roof, and the bottom row
+    // is left as plain wall (a "ground floor" band) so it doesn't look
+    // like windows go all the way to the sidewalk. Same fixed
+    // "light from the left" cel-shading as every other silhouette here.
+    //
+    // Returns: 3'b001 = wall lit, 3'b010 = wall shadow,
+    //          3'b011 = roof parapet, 3'b100 = window, 3'b000 = none
+    // ------------------------------------------------------------------
+    function [2:0] building_at;
+        input [9:0] px, py;
+        input [9:0] bx, by;   // bx = building center x, by = ground/base y
+        input [4:0] bw;       // wall half-width
+        input [4:0] bh;       // wall height (tall)
+        reg   [9:0] dx;
+        reg   [9:0] wall_top;
+        reg   [9:0] local_x, local_y;
+        reg         is_lit, win_col, win_row;
+        begin
+            wall_top = by - {5'd0, bh};
+            dx       = (px >= bx) ? (px - bx) : (bx - px);
+            is_lit   = (px < bx);
+            if ((py >= wall_top) && (py <= by) && (dx <= {5'd0, bw})) begin
+                if (py < wall_top + 10'd3) begin
+                    building_at = 3'b011; // flat rooftop parapet ledge
+                end else begin
+                    local_x = dx;
+                    local_y = py - wall_top;
+                    win_col = (local_x[2:0] < 3'd2) && (dx < {5'd0, bw} - 10'd1);   // corner pilaster left dark
+                    win_row = (local_y[2:0] < 3'd2) && (py < by - 10'd1);           // ground-floor band left dark
+                    if (win_col && win_row)
+                        building_at = 3'b100; // window
+                    else
+                        building_at = is_lit ? 3'b001 : 3'b010; // wall lit/shadow
+                end
+            end else
+                building_at = 3'b000;
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Minimarket: a small single-storey storefront -- flat roof, a
+    // bright awning/signboard band right under the roofline (like a
+    // real convenience-store sign), a glass door, and a wide storefront
+    // window. Rarer than the office towers above, so it reads as a
+    // landmark/corner-store rather than just another block.
+    //
+    // Returns: 3'b001 = wall lit, 3'b010 = wall shadow, 3'b011 = roof,
+    //          3'b100 = storefront window, 3'b101 = door,
+    //          3'b110 = awning/sign band, 3'b000 = none
+    // ------------------------------------------------------------------
+    function [2:0] minimarket_at;
+        input [9:0] px, py;
+        input [9:0] mx, my;   // mx = center x, my = ground/base y
+        input [4:0] mw;       // wall half-width
+        input [4:0] mh;       // wall height
+        reg   [9:0] dx;
+        reg   [9:0] wall_top, sign_bot, door_top, door_hw, win_l, win_r;
+        reg         is_lit;
+        begin
+            wall_top = my - {5'd0, mh};
+            sign_bot = wall_top + ({5'd0, mh} >> 2) + 10'd2;
+            door_top = my - ({6'd0, mh} >> 1);
+            door_hw  = {6'd0, mw} >> 2;
+            if (door_hw < 10'd2) door_hw = 10'd2;
+            win_l  = door_hw + 10'd2;
+            win_r  = {5'd0, mw} - 10'd1;
+            dx     = (px >= mx) ? (px - mx) : (mx - px);
+            is_lit = (px < mx);
+            if ((py >= wall_top) && (py <= my) && (dx <= {5'd0, mw})) begin
+                if (py < wall_top + 10'd2)
+                    minimarket_at = 3'b011; // flat roof edge
+                else if (py < sign_bot)
+                    minimarket_at = 3'b110; // bright awning / signboard band
+                else if ((dx <= door_hw) && (py >= door_top))
+                    minimarket_at = 3'b101; // glass door
+                else if ((dx >= win_l) && (dx <= win_r) && (py >= door_top))
+                    minimarket_at = 3'b100; // storefront window
+                else
+                    minimarket_at = is_lit ? 3'b001 : 3'b010; // wall lit/shadow
+            end else
+                minimarket_at = 3'b000;
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Billboard iklan pinggir jalan: satu tiang tipis menopang papan
+    // persegi lebar di atasnya, dengan bingkai gelap dan satu pita aksen
+    // horizontal di tengah papan (biar keliatan kayak ada "isi iklan",
+    // bukan cuma kotak polos). Idiom sama dengan minimarket_at di atas
+    // -- reg-reg lokal, semua batas dihitung dari (mx,my) + ukuran.
+    // ------------------------------------------------------------------
+    function [2:0] billboard_at;
+        input [9:0] px, py;
+        input [9:0] mx, my;     // mx = pusat x, my = alas/tanah (kaki tiang)
+        input [4:0] board_hw;   // setengah lebar papan iklan
+        input [4:0] board_h;    // tinggi papan iklan
+        input [4:0] pole_h;     // tinggi tiang di bawah papan
+        reg   [9:0] dx;
+        reg   [9:0] board_bot, board_top, stripe_top, stripe_bot;
+        reg   [4:0] pole_hw;
+        begin
+            board_bot  = my - {5'd0, pole_h};
+            board_top  = board_bot - {5'd0, board_h};
+            stripe_top = board_top + ({5'd0, board_h} >> 2) + 10'd1;
+            stripe_bot = board_bot - ({5'd0, board_h} >> 2) - 10'd1;
+            pole_hw    = 5'd2;
+            dx = (px >= mx) ? (px - mx) : (mx - px);
+
+            if ((py >= board_top) && (py < board_bot) && (dx <= {5'd0, board_hw})) begin
+                if ((py < board_top + 10'd2) || (py >= board_bot - 10'd2) ||
+                    (dx >= {5'd0, board_hw} - 10'd2))
+                    billboard_at = 3'b011; // bingkai papan
+                else if ((py >= stripe_top) && (py < stripe_bot))
+                    billboard_at = 3'b101; // pita aksen di tengah papan
+                else
+                    billboard_at = 3'b100; // wajah papan (warna dasar iklan)
+            end else if ((py >= board_bot) && (py <= my) && (dx <= {5'd0, pole_hw})) begin
+                billboard_at = (px < mx) ? 3'b001 : 3'b010; // tiang lit/shadow
+            end else
+                billboard_at = 3'b000;
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
     // Village scenery: houses AND windmills scattered along both sides
     // of the road, further back than the treeline. Unlike the evenly-
     // spaced treeline, each of the NUM_SCENERY_SIDE slots per side picks
@@ -1054,7 +1309,7 @@ module render_static (
     // whole village still bends smoothly with the road and keeps
     // scrolling forever.
     // ------------------------------------------------------------------
-    localparam NUM_SCENERY_SIDE        = 5; // reduced from 9 -- see note below about compile stability
+    localparam NUM_SCENERY_SIDE        = 7; // bumped up from 5 for a denser building row -- see note below about compile stability
     localparam [9:0] SCEN_Y_STEP       = (TREE_Y_MAX - TREE_Y_MIN) / NUM_SCENERY_SIDE; // 40
     localparam [9:0] SCEN_RIGHT_OFF    = SCEN_Y_STEP >> 1; // stagger right side vs left
     localparam [9:0] SCEN_BASE_GAP     = 10'd22; // baseline extra gap beyond the treeline
@@ -1062,22 +1317,51 @@ module render_static (
     localparam       HOUSE_SCALE_SHIFT = 4;
     localparam [9:0] WINDMILL_BASE_HALF   = 10'd3; // tower half-width at the horizon
     localparam       WINDMILL_SCALE_SHIFT = 4;
+    localparam [9:0] BUILDING_BASE_HALF   = 10'd6;  // tower half-width at the horizon
+    localparam       BUILDING_SCALE_SHIFT = 5;
+    localparam [9:0] MARKET_BASE_HALF     = 10'd9;  // minimarket half-width at the horizon
+    localparam       MARKET_SCALE_SHIFT   = 4;
+    localparam [9:0] BILLBOARD_BASE_HALF     = 10'd26; // papan iklan lebar & luas -- setengah lebar di horizon
+    localparam       BILLBOARD_SCALE_SHIFT   = 6;
+    localparam [9:0] BILLBOARD_H_BASE        = 10'd16; // tinggi papan iklan di horizon
+    localparam       BILLBOARD_H_SCALE_SHIFT = 6;
+    localparam [9:0] BILLBOARD_POLE_H_BASE   = 10'd6;  // tinggi tiang di horizon
+    localparam       BILLBOARD_POLE_SCALE_SHIFT = 5;
 
     wire [2:0] hp_left  [0:NUM_SCENERY_SIDE-1];
     wire [2:0] hp_right [0:NUM_SCENERY_SIDE-1];
     wire [2:0] wp_left  [0:NUM_SCENERY_SIDE-1];
     wire [2:0] wp_right [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] bp_left  [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] bp_right [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] mp_left  [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] mp_right [0:NUM_SCENERY_SIDE-1];
+    wire [2:0] adp_left  [0:NUM_SCENERY_SIDE-1]; // billboard, sisi kiri
+    wire [2:0] adp_right [0:NUM_SCENERY_SIDE-1]; // billboard, sisi kanan
 
     generate
         for (gi = 0; gi < NUM_SCENERY_SIDE; gi = gi + 1) begin : gen_left_scenery
             // Elaboration-time pseudo-random hash of this slot's index --
             // just an LCG-flavored constant expression, unique per gi.
             localparam [15:0] SEED       = (gi * 16'd40503) + 16'd18041;
-            localparam [2:0]  TYPE_SEL   = SEED[2:0];   // 0-3 house, 4/5/7 windmill, 6 empty
+            localparam [2:0]  TYPE_SEL   = SEED[2:0];   // rural: 0-3 house, 4/5/7 windmill, 6 empty
             localparam [9:0]  PHASE_JIT  = {6'd0, SEED[6:3]};   // 0..15 px along-road jitter
             localparam [9:0]  GAP_JIT    = {7'd0, SEED[9:7]} << 2; // 0..28 px depth jitter
+            // Extra, independent random gap used only for city buildings --
+            // pulls from bits GAP_JIT/PHASE_JIT never touch, so it isn't
+            // correlated with them. This is what keeps a denser row of
+            // buildings from reading as one fused wall: each building gets
+            // its own random extra setback, so neighbours end up at
+            // unpredictable distances instead of all touching.
+            localparam [9:0]  BLDG_XTRA_JIT = {4'd0, SEED[15:10]}; // 0..63 px
             localparam        IS_HOUSE   = (TYPE_SEL <= 3'd3);
             localparam        IS_WINDMILL = (TYPE_SEL == 3'd4) || (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
+            // Slot 6 dulu kosong (gap) di zona rural -- sekarang dipakai
+            // buat billboard, jadi tetap 1/8 slot yang "bukan rumah/kincir".
+            localparam        IS_BILLBOARD = (TYPE_SEL == 3'd6);
+            // city: 0,1,2,3,4,6 building (dense block), 5/7 minimarket (rarer landmark)
+            localparam        IS_BUILDING = (TYPE_SEL <= 3'd4) || (TYPE_SEL == 3'd6);
+            localparam        IS_MARKET   = (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
 
             localparam [9:0] base_sy = TREE_Y_MIN + (SCEN_Y_STEP >> 1) + gi * SCEN_Y_STEP + PHASE_JIT;
 
@@ -1097,17 +1381,49 @@ module render_static (
             // to be reserved here too, or the blades reach back past the
             // gap and swipe into the treeline.
             wire [9:0] this_wind_blade_r = (this_wind_half <<< 1) + 10'd8;
-            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_blade_r;
+            wire [9:0] this_board_half = BILLBOARD_BASE_HALF + (this_dy >> BILLBOARD_SCALE_SHIFT);
+            wire [9:0] this_board_h    = BILLBOARD_H_BASE    + (this_dy >> BILLBOARD_H_SCALE_SHIFT);
+            wire [9:0] this_pole_h     = BILLBOARD_POLE_H_BASE + (this_dy >> BILLBOARD_POLE_SCALE_SHIFT);
+            wire [9:0] this_rural_half = IS_HOUSE ? this_house_half
+                                       : IS_WINDMILL ? this_wind_blade_r
+                                       : this_board_half;
 
-            wire [9:0] this_sx = this_center - this_rhalf - TREE_GAP - SCEN_BASE_GAP - GAP_JIT - this_obj_half;
+            // City-district counterparts: a tall building (footprint =
+            // its wall half-width) or a minimarket (footprint = its own
+            // half-width, wider/flatter than a house).
+            wire [9:0] this_building_half   = BUILDING_BASE_HALF + (this_dy >> BUILDING_SCALE_SHIFT);
+            wire [9:0] this_building_height = this_building_half + (this_building_half >> 1) + 10'd5;
+            wire [9:0] this_market_half     = MARKET_BASE_HALF + (this_dy >> MARKET_SCALE_SHIFT);
+            wire [9:0] this_market_height   = (this_market_half >> 1) + 10'd3;
+            wire [9:0] this_city_half   = IS_BUILDING ? this_building_half : this_market_half;
 
-            assign hp_left[gi] = IS_HOUSE ? house_at(x, y, this_sx, this_sy,
+            // Which footprint reserves the gap this frame depends on the
+            // (runtime) district, so the road shoulder never looks too
+            // crowded or too empty as the world scrolls between zones.
+            wire [9:0] this_obj_half = in_city_zone ? this_city_half : this_rural_half;
+
+            // Only buildings get the extra randomized setback -- houses/
+            // windmills/minimarkets keep their original spacing.
+            wire [9:0] this_bldg_extra = (in_city_zone && IS_BUILDING) ? BLDG_XTRA_JIT : 10'd0;
+
+            wire [9:0] this_sx = this_center - this_rhalf - TREE_GAP - SCEN_BASE_GAP - GAP_JIT - this_bldg_extra - this_obj_half;
+
+            assign hp_left[gi] = (!in_city_zone && IS_HOUSE) ? house_at(x, y, this_sx, this_sy,
                                                 this_house_half[4:0], (this_house_half[4:0] >> 1) + 5'd2,
                                                 (this_house_half[4:0] >> 1) + 5'd3, this_house_half[4:0] + 5'd2)
                                            : 3'b000;
-            assign wp_left[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
+            assign wp_left[gi] = (!in_city_zone && IS_WINDMILL) ? windmill_at(x, y, this_sx, this_sy,
                                                 this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
                                                 this_wind_blade_r[4:0], windmill_spin)
+                                              : 3'b000;
+            assign adp_left[gi] = (!in_city_zone && IS_BILLBOARD) ? billboard_at(x, y, this_sx, this_sy,
+                                                this_board_half[4:0], this_board_h[4:0], this_pole_h[4:0])
+                                              : 3'b000;
+            assign bp_left[gi] = (in_city_zone && IS_BUILDING) ? building_at(x, y, this_sx, this_sy,
+                                                this_building_half[4:0], this_building_height[4:0])
+                                              : 3'b000;
+            assign mp_left[gi] = (in_city_zone && IS_MARKET) ? minimarket_at(x, y, this_sx, this_sy,
+                                                this_market_half[4:0], this_market_height[4:0])
                                               : 3'b000;
         end
 
@@ -1116,8 +1432,12 @@ module render_static (
             localparam [2:0]  TYPE_SEL   = SEED[2:0];
             localparam [9:0]  PHASE_JIT  = {6'd0, SEED[6:3]};
             localparam [9:0]  GAP_JIT    = {7'd0, SEED[9:7]} << 2;
+            localparam [9:0]  BLDG_XTRA_JIT = {4'd0, SEED[15:10]}; // 0..63 px, buildings only
             localparam        IS_HOUSE   = (TYPE_SEL <= 3'd3);
             localparam        IS_WINDMILL = (TYPE_SEL == 3'd4) || (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
+            localparam        IS_BILLBOARD = (TYPE_SEL == 3'd6);
+            localparam        IS_BUILDING = (TYPE_SEL <= 3'd4) || (TYPE_SEL == 3'd6);
+            localparam        IS_MARKET   = (TYPE_SEL == 3'd5) || (TYPE_SEL == 3'd7);
 
             localparam [9:0] base_sy = TREE_Y_MIN + (SCEN_Y_STEP >> 1) + SCEN_RIGHT_OFF + gi * SCEN_Y_STEP + PHASE_JIT;
 
@@ -1132,17 +1452,41 @@ module render_static (
             wire [9:0] this_house_half = HOUSE_BASE_HALF    + (this_dy >> HOUSE_SCALE_SHIFT);
             wire [9:0] this_wind_half  = WINDMILL_BASE_HALF + (this_dy >> WINDMILL_SCALE_SHIFT);
             wire [9:0] this_wind_blade_r = (this_wind_half <<< 1) + 10'd8;
-            wire [9:0] this_obj_half   = IS_HOUSE ? this_house_half : this_wind_blade_r;
+            wire [9:0] this_board_half = BILLBOARD_BASE_HALF + (this_dy >> BILLBOARD_SCALE_SHIFT);
+            wire [9:0] this_board_h    = BILLBOARD_H_BASE    + (this_dy >> BILLBOARD_H_SCALE_SHIFT);
+            wire [9:0] this_pole_h     = BILLBOARD_POLE_H_BASE + (this_dy >> BILLBOARD_POLE_SCALE_SHIFT);
+            wire [9:0] this_rural_half = IS_HOUSE ? this_house_half
+                                       : IS_WINDMILL ? this_wind_blade_r
+                                       : this_board_half;
 
-            wire [9:0] this_sx = this_center + this_rhalf + TREE_GAP + SCEN_BASE_GAP + GAP_JIT + this_obj_half;
+            wire [9:0] this_building_half   = BUILDING_BASE_HALF + (this_dy >> BUILDING_SCALE_SHIFT);
+            wire [9:0] this_building_height = this_building_half + (this_building_half >> 1) + 10'd5;
+            wire [9:0] this_market_half     = MARKET_BASE_HALF + (this_dy >> MARKET_SCALE_SHIFT);
+            wire [9:0] this_market_height   = (this_market_half >> 1) + 10'd3;
+            wire [9:0] this_city_half   = IS_BUILDING ? this_building_half : this_market_half;
 
-            assign hp_right[gi] = IS_HOUSE ? house_at(x, y, this_sx, this_sy,
+            wire [9:0] this_obj_half = in_city_zone ? this_city_half : this_rural_half;
+
+            wire [9:0] this_bldg_extra = (in_city_zone && IS_BUILDING) ? BLDG_XTRA_JIT : 10'd0;
+
+            wire [9:0] this_sx = this_center + this_rhalf + TREE_GAP + SCEN_BASE_GAP + GAP_JIT + this_bldg_extra + this_obj_half;
+
+            assign hp_right[gi] = (!in_city_zone && IS_HOUSE) ? house_at(x, y, this_sx, this_sy,
                                                 this_house_half[4:0], (this_house_half[4:0] >> 1) + 5'd2,
                                                 (this_house_half[4:0] >> 1) + 5'd3, this_house_half[4:0] + 5'd2)
                                             : 3'b000;
-            assign wp_right[gi] = IS_WINDMILL ? windmill_at(x, y, this_sx, this_sy,
+            assign wp_right[gi] = (!in_city_zone && IS_WINDMILL) ? windmill_at(x, y, this_sx, this_sy,
                                                 this_wind_half[4:0], (this_wind_half[4:0] <<< 1) + 5'd6,
                                                 this_wind_blade_r[4:0], windmill_spin)
+                                               : 3'b000;
+            assign adp_right[gi] = (!in_city_zone && IS_BILLBOARD) ? billboard_at(x, y, this_sx, this_sy,
+                                                this_board_half[4:0], this_board_h[4:0], this_pole_h[4:0])
+                                               : 3'b000;
+            assign bp_right[gi] = (in_city_zone && IS_BUILDING) ? building_at(x, y, this_sx, this_sy,
+                                                this_building_half[4:0], this_building_height[4:0])
+                                               : 3'b000;
+            assign mp_right[gi] = (in_city_zone && IS_MARKET) ? minimarket_at(x, y, this_sx, this_sy,
+                                                this_market_half[4:0], this_market_height[4:0])
                                                : 3'b000;
         end
     endgenerate
@@ -1151,6 +1495,9 @@ module render_static (
     // down to the category flags the color mux needs.
     reg house_wall_lit, house_wall_shadow, house_roof, house_window, house_door;
     reg windmill_tower_lit, windmill_tower_shadow, windmill_blade, windmill_hub;
+    reg building_wall_lit, building_wall_shadow, building_roof, building_window;
+    reg market_wall_lit, market_wall_shadow, market_roof, market_window, market_door, market_sign;
+    reg billboard_pole_lit, billboard_pole_shadow, billboard_frame, billboard_face, billboard_stripe;
     integer hi_i;
     always @(*) begin
         house_wall_lit    = 1'b0;
@@ -1162,6 +1509,21 @@ module render_static (
         windmill_tower_shadow = 1'b0;
         windmill_blade         = 1'b0;
         windmill_hub            = 1'b0;
+        building_wall_lit    = 1'b0;
+        building_wall_shadow = 1'b0;
+        building_roof        = 1'b0;
+        building_window      = 1'b0;
+        market_wall_lit    = 1'b0;
+        market_wall_shadow = 1'b0;
+        market_roof        = 1'b0;
+        market_window      = 1'b0;
+        market_door        = 1'b0;
+        market_sign        = 1'b0;
+        billboard_pole_lit    = 1'b0;
+        billboard_pole_shadow = 1'b0;
+        billboard_frame       = 1'b0;
+        billboard_face        = 1'b0;
+        billboard_stripe      = 1'b0;
         for (hi_i = 0; hi_i < NUM_SCENERY_SIDE; hi_i = hi_i + 1) begin
             if (hp_left[hi_i] == 3'b001 || hp_right[hi_i] == 3'b001) house_wall_lit    = 1'b1;
             if (hp_left[hi_i] == 3'b010 || hp_right[hi_i] == 3'b010) house_wall_shadow = 1'b1;
@@ -1173,6 +1535,24 @@ module render_static (
             if (wp_left[hi_i] == 3'b010 || wp_right[hi_i] == 3'b010) windmill_tower_shadow = 1'b1;
             if (wp_left[hi_i] == 3'b011 || wp_right[hi_i] == 3'b011) windmill_blade        = 1'b1;
             if (wp_left[hi_i] == 3'b100 || wp_right[hi_i] == 3'b100) windmill_hub          = 1'b1;
+
+            if (bp_left[hi_i] == 3'b001 || bp_right[hi_i] == 3'b001) building_wall_lit    = 1'b1;
+            if (bp_left[hi_i] == 3'b010 || bp_right[hi_i] == 3'b010) building_wall_shadow = 1'b1;
+            if (bp_left[hi_i] == 3'b011 || bp_right[hi_i] == 3'b011) building_roof        = 1'b1;
+            if (bp_left[hi_i] == 3'b100 || bp_right[hi_i] == 3'b100) building_window      = 1'b1;
+
+            if (mp_left[hi_i] == 3'b001 || mp_right[hi_i] == 3'b001) market_wall_lit    = 1'b1;
+            if (mp_left[hi_i] == 3'b010 || mp_right[hi_i] == 3'b010) market_wall_shadow = 1'b1;
+            if (mp_left[hi_i] == 3'b011 || mp_right[hi_i] == 3'b011) market_roof        = 1'b1;
+            if (mp_left[hi_i] == 3'b100 || mp_right[hi_i] == 3'b100) market_window      = 1'b1;
+            if (mp_left[hi_i] == 3'b101 || mp_right[hi_i] == 3'b101) market_door        = 1'b1;
+            if (mp_left[hi_i] == 3'b110 || mp_right[hi_i] == 3'b110) market_sign        = 1'b1;
+
+            if (adp_left[hi_i] == 3'b001 || adp_right[hi_i] == 3'b001) billboard_pole_lit    = 1'b1;
+            if (adp_left[hi_i] == 3'b010 || adp_right[hi_i] == 3'b010) billboard_pole_shadow = 1'b1;
+            if (adp_left[hi_i] == 3'b011 || adp_right[hi_i] == 3'b011) billboard_frame       = 1'b1;
+            if (adp_left[hi_i] == 3'b100 || adp_right[hi_i] == 3'b100) billboard_face        = 1'b1;
+            if (adp_left[hi_i] == 3'b101 || adp_right[hi_i] == 3'b101) billboard_stripe      = 1'b1;
         end
     end
 
@@ -1245,6 +1625,20 @@ module render_static (
     wire [7:0] horizon_r = {bg_horizon_pixel[11:8], bg_horizon_pixel[11:8]};
     wire [7:0] horizon_g = {bg_horizon_pixel[7:4],  bg_horizon_pixel[7:4]};
     wire [7:0] horizon_b = {bg_horizon_pixel[3:0],  bg_horizon_pixel[3:0]};
+
+    // Warna horizon EFEKTIF yang dipakai blend di bawah: ikut diredupkan
+    // saat kota malam dan dipucatkan saat zona salju, supaya pita fade
+    // tepat di bawah langit tetap nyambung dengan langit yang sudah
+    // diberi perlakuan malam/salju di cabang y<120.
+    wire [7:0] horizon_r_eff = in_night_zone ? {1'b0, horizon_r[7:1]} :
+                               in_snow_zone  ? blend4(horizon_r, 8'd245, 4'd5) :
+                                               horizon_r;
+    wire [7:0] horizon_g_eff = in_night_zone ? {1'b0, horizon_g[7:1]} :
+                               in_snow_zone  ? blend4(horizon_g, 8'd248, 4'd5) :
+                                               horizon_g;
+    wire [7:0] horizon_b_eff = in_night_zone ? ({1'b0, horizon_b[7:1]} + {3'b0, horizon_b[7:3]}) :
+                               in_snow_zone  ? blend4(horizon_b, 8'd252, 4'd5) :
+                                               horizon_b;
 
     // Fade window just below the horizon line: at y==120 the ground is
     // (almost) entirely the sampled mountain/sky color, easing to 100%
@@ -1527,6 +1921,15 @@ localparam CAR_W = 10'd128;
     reg [7:0] obstacle_rand;   // 8-bit LFSR, sampled at respawn for a pseudo-random lane
     reg       obstacle_overlap_prev; // overlap state one frame ago, for edge detection
 
+    // Non-aktif sebentar (OBSTACLE_SPAWN_GAP frame) di antara satu
+    // obstacle habis (ketabrak/lolos) dengan obstacle berikutnya
+    // muncul -- sama seperti pola rival_active/rival_spawn_timer di
+    // bawah. Dulu obstacle langsung respawn di frame berikutnya (jeda
+    // 0), jadi kelihatan "mepet"/menumpuk terus-terusan.
+    localparam [15:0] OBSTACLE_SPAWN_GAP = 16'd50; // ~0.8 detik @60fps -- jarak "napas" tanpa bikin jalan sepi
+    reg        obstacle_active;
+    reg [15:0] obstacle_spawn_timer;
+
     // ------------------------------------------------------------------
     // Lives: 3 starting chances, up to LIVES_MAX -- extra lives now come
     // from catching the star pickup (see below) instead of an automatic
@@ -1569,15 +1972,99 @@ localparam CAR_W = 10'd128;
     initial bonus_overlap_prev = 1'b0;
     initial bonus_spawn_timer  = BONUS_SPAWN_INTERVAL;
 
+    // ------------------------------------------------------------------
+    // Power-up NITRO: pickup yang sama persis mekanismenya dengan
+    // bintang nyawa (spawn timer/lane/perspektif dipakai bersama lewat
+    // register bonus_* di atas), hanya di-roll tipenya saat spawn:
+    // bonus_is_nitro = 1 -> digambar biru-cyan, saat ditangkap memberi
+    // +NITRO_PICKUP_SCORE poin dan kecepatan dunia +3 selama
+    // NITRO_DURATION frame (lihat world_scroll_speed di atas).
+    // ------------------------------------------------------------------
+    localparam [15:0] NITRO_DURATION     = 16'd240; // ~4 detik @60fps
+    localparam [15:0] NITRO_PICKUP_SCORE = 16'd25;
+
+    reg        bonus_is_nitro;
+    reg [15:0] nitro_timer;
+    initial bonus_is_nitro = 1'b0;
+    initial nitro_timer    = 16'd0;
+
+    wire nitro_active = (nitro_timer != 16'd0);
+
+    // ------------------------------------------------------------------
+    // Traffic / mobil rival: kendaraan lain yang berjalan SEARAH dengan
+    // pemain, lebih lambat dari dunia -- jadi ia mendekat pelan-pelan
+    // dan bisa DISALIP (bonus poin) atau ditabrak (kehilangan nyawa,
+    // sama seperti rintangan biasa). Memakai matematika perspektif/
+    // lajur yang persis sama dengan obstacle, hanya kecepatan
+    // mendekatnya separuh -- itulah yang membuatnya terbaca sebagai
+    // "mobil lain yang ikut melaju", bukan rintangan diam.
+    // ------------------------------------------------------------------
+    localparam [15:0] RIVAL_SPAWN_INTERVAL = 16'd300; // jeda antar kemunculan traffic (~5s)
+    localparam [15:0] POINTS_PER_OVERTAKE  = 16'd15;  // bonus berhasil menyalip
+
+    reg        rival_active;
+    reg [9:0]  rival_y;
+    reg [1:0]  rival_lane;
+    reg        rival_overlap_prev;
+    reg [15:0] rival_spawn_timer;
+    initial rival_active       = 1'b0;
+    initial rival_y            = OBS_Y_START;
+    initial rival_lane         = 2'd0;
+    initial rival_overlap_prev = 1'b0;
+    initial rival_spawn_timer  = RIVAL_SPAWN_INTERVAL;
+
+    // Mendekat dengan separuh laju dunia (+1 supaya tidak pernah 0):
+    // relatif terhadap aspal ia tetap melaju maju, pemain menyusulnya.
+    wire [9:0] RIVAL_SPEED = (world_scroll_speed >> 1) + 10'd1;
+
+    // ------------------------------------------------------------------
+    // Near-miss ("nyaris nabrak"): kotak rintangan yang DIPERLEBAR
+    // sedikit; kalau kotak lebar itu sempat menyentuh mobil selama
+    // rintangan lewat TANPA tabrakan sungguhan, dodge tersebut dihitung
+    // "mepet" -> bonus poin ekstra + kilatan emas singkat. Elemen
+    // risk-reward: sengaja ambil jalur mepet = skor lebih besar.
+    // ------------------------------------------------------------------
+    localparam [9:0]  NEAR_MARGIN_W   = 10'd14;
+    localparam [9:0]  NEAR_MARGIN_H   = 10'd10;
+    localparam [15:0] NEAR_MISS_BONUS = 16'd10;
+
+    reg near_miss_latch;
+    initial near_miss_latch = 1'b0;
+
+    // ------------------------------------------------------------------
+    // Feedback visual: flash merah saat nabrak, kilatan emas saat
+    // near-miss dodge, dan confetti tiap skor menembus kelipatan 1000.
+    // Semuanya cuma counter kecil yang turun sekali per frame; pewarnaan
+    // dilakukan di blok mux warna paling bawah.
+    // ------------------------------------------------------------------
+    localparam [15:0] MILESTONE_STEP = 16'd1000;
+
+    reg [3:0]  hit_flash;        // bobot blend merah (15 = paling kuat)
+    reg [3:0]  nm_flash;         // bobot blend emas near-miss
+    reg [4:0]  celebrate_timer;  // frame tersisa hujan confetti
+    reg [15:0] milestone_target; // ambang skor berikutnya yang dirayakan
+    reg [9:0]  rain_scroll;      // fase jatuh garis hujan
+    reg [3:0]  lightning_flash;    // bobot blend putih-kebiruan sambaran petir
+    reg [9:0]  lightning_cooldown; // frame tersisa sebelum sambaran berikutnya diizinkan
+    initial hit_flash        = 4'd0;
+    initial nm_flash         = 4'd0;
+    initial celebrate_timer  = 5'd0;
+    initial milestone_target = MILESTONE_STEP;
+    initial rain_scroll      = 10'd0;
+    initial lightning_flash    = 4'd0;
+    initial lightning_cooldown = 10'd90;
+
     initial obstacle_y            = OBS_Y_START;
-    initial obstacle_lane         = 2'd1;
+    initial obstacle_lane         = 2'd0;
     initial obstacle_is_car       = 1'b1;
     initial obstacle_rand         = 8'hA5; // must be non-zero for the LFSR to run
     initial obstacle_overlap_prev = 1'b0;
+    initial obstacle_active       = 1'b1; // obstacle pertama langsung tampil begitu game mulai
+    initial obstacle_spawn_timer  = 16'd0;
     initial score                 = 16'd0;
     initial game_over              = 1'b0;
 
-    wire obstacle_reached_end = (obstacle_y + OBSTACLE_SPEED) >= OBS_Y_END;
+    wire obstacle_reached_end = obstacle_active && ((obstacle_y + OBSTACLE_SPEED) >= OBS_Y_END);
 
     // ------------------------------------------------------------------
     // NOTE: a plain "+1 every frame" counter sampled only at respawn
@@ -1596,6 +2083,12 @@ localparam CAR_W = 10'd128;
     // lowest 2 bits.
     wire [1:0] next_lane_raw = obstacle_rand[1:0] ^ obstacle_rand[6:5];
     wire [1:0] next_lane     = (next_lane_raw == 2'd3) ? 2'd1 : next_lane_raw;
+
+    // Obstacle (musuh) spawn lane -- kiri/kanan saja, lajur TENGAH
+    // sengaja dihilangkan supaya selalu ada jalur aman di tengah.
+    // Dipisah dari next_lane di atas karena next_lane masih dipakai
+    // bonus_lane (bintang bonus tetap boleh muncul di ketiga lajur).
+    wire [1:0] obstacle_next_lane = (obstacle_rand[1] ^ obstacle_rand[6]) ? 2'd2 : 2'd0;
 
     // Random vehicle type for the next spawn -- a different LFSR bit
     // than the lane picker above uses, so the two choices don't end up
@@ -1631,7 +2124,8 @@ localparam CAR_W = 10'd128;
     wire signed [10:0] obs_col_rel = $signed({1'b0, x}) - $signed({1'b0, obstacle_x});
     wire signed [10:0] obs_row_rel = $signed({1'b0, y}) - $signed({1'b0, obstacle_y});
 
-    wire is_obstacle_area = (obs_col_rel >= -$signed({1'b0, obs_half_w})) && (obs_col_rel <= $signed({1'b0, obs_half_w})) &&
+    wire is_obstacle_area = obstacle_active &&
+                             (obs_col_rel >= -$signed({1'b0, obs_half_w})) && (obs_col_rel <= $signed({1'b0, obs_half_w})) &&
                              (obs_row_rel >= -$signed({1'b0, obs_half_h})) && (obs_row_rel <= $signed({1'b0, obs_half_h}));
 
     // ------------------------------------------------------------------
@@ -1642,39 +2136,87 @@ localparam CAR_W = 10'd128;
     // truncation risk here the way there was for the circular shapes
     // elsewhere in this file (star/boulder/person).
     //
-    // Car: body fill, a darker rear-window band across the top third,
-    // and two bright taillights at the bottom corners.
-    // Motorcycle: a small helmet band at the very top, body/seat below
-    // it, and a single centered taillight at the bottom.
+    // The box is split into 4 horizontal bands (each ~25% of the
+    // height) so each vehicle gets several stacked regions instead of
+    // one flat rectangle:
+    //
+    // Car:        roof/greenhouse (narrow) -> rear window (narrower
+    //             still, dark glass) -> body -> bumper band with a
+    //             centered license plate and corner taillights.
+    // Motorcycle: helmet (narrow, centered) -> rider's shoulders/back
+    //             (full width) -> seat/bike body (narrow column) ->
+    //             rear wheel, with a small brake light on top of it.
     // ------------------------------------------------------------------
     wire signed [10:0] obs_top   = -$signed({1'b0, obs_half_h});
     wire signed [10:0] obs_bot   =  $signed({1'b0, obs_half_h});
     wire signed [10:0] obs_left  = -$signed({1'b0, obs_half_w});
     wire signed [10:0] obs_right =  $signed({1'b0, obs_half_w});
 
-    wire [9:0] obs_band_h = (obs_half_h > 10'd1) ? (obs_half_h >> 1) : 10'd1; // ~half the box height
+    // Row position measured from the top of the box (0 .. 2*half_h),
+    // so the four bands below are simple fractions of the current box
+    // height regardless of how big the box currently is (near/far).
+    wire signed [10:0] obs_row_off_s = obs_row_rel + $signed({1'b0, obs_half_h});
+    wire [9:0] obs_row_off    = obs_row_off_s[9:0];
+    wire [9:0] obs_quarter_h  = (obs_half_h > 10'd1) ? (obs_half_h >> 1) : 10'd1; // ~25% of full height
+    wire [9:0] obs_half_hgt   = (obs_half_h > 10'd0) ? obs_half_h        : 10'd1; // ~50% of full height
 
-    // Car-only regions
-    wire obs_car_window = obstacle_is_car &&
-                          (obs_row_rel >= obs_top) &&
-                          (obs_row_rel <= obs_top + $signed({1'b0, obs_band_h}));
+    wire obs_band0 = obs_row_off <  obs_quarter_h;                                       // top 0-25%    (roof / helmet)
+    wire obs_band1 = (obs_row_off >= obs_quarter_h) && (obs_row_off < obs_half_hgt);      // 25-50%       (window / shoulders)
+    wire obs_band2 = (obs_row_off >= obs_half_hgt)  && (obs_row_off < obs_half_hgt + obs_quarter_h); // 50-75% (body / seat)
+    wire obs_band3 = obs_row_off >= (obs_half_hgt + obs_quarter_h);                       // bottom 75-100% (bumper / wheel)
 
+    // ---------------- Car-only regions ----------------
+    // Roof: narrower than the full body width, so the greenhouse
+    // visibly tapers in from the body instead of being a flat block.
+    wire [9:0] obs_car_roof_w = (obs_half_w > (obs_half_w >> 2)) ? (obs_half_w - (obs_half_w >> 2)) : 10'd1;
+    wire obs_car_roof = obstacle_is_car && obs_band0 &&
+                        (obs_col_rel >= -$signed({1'b0, obs_car_roof_w})) &&
+                        (obs_col_rel <=  $signed({1'b0, obs_car_roof_w}));
+
+    // Rear window: narrower again than the roof -- dark glass.
+    wire [9:0] obs_car_win_w = (obs_half_w > 10'd1) ? (obs_half_w >> 1) : 10'd1;
+    wire obs_car_window = obstacle_is_car && obs_band1 &&
+                          (obs_col_rel >= -$signed({1'b0, obs_car_win_w})) &&
+                          (obs_col_rel <=  $signed({1'b0, obs_car_win_w}));
+
+    // License plate: small dark rectangle centered in the bumper band.
+    wire [9:0] obs_car_plate_w = (obs_half_w > 10'd2) ? (obs_half_w >> 2) : 10'd1;
+    wire obs_car_plate = obstacle_is_car && obs_band3 &&
+                         (obs_col_rel >= -$signed({1'b0, obs_car_plate_w})) &&
+                         (obs_col_rel <=  $signed({1'b0, obs_car_plate_w}));
+
+    // Taillights: bright corners of the bumper band.
     wire [9:0] obs_car_light_w = (obs_half_w > 10'd3) ? (obs_half_w >> 2) : 10'd1;
-    wire obs_car_taillight = obstacle_is_car &&
-                             (obs_row_rel >= obs_bot - $signed({1'b0, obs_band_h})) &&
-                             (obs_row_rel <= obs_bot) &&
+    wire obs_car_taillight = obstacle_is_car && obs_band3 &&
                              (((obs_col_rel >= obs_left) && (obs_col_rel <= obs_left + $signed({1'b0, obs_car_light_w}))) ||
                               ((obs_col_rel <= obs_right) && (obs_col_rel >= obs_right - $signed({1'b0, obs_car_light_w}))));
 
-    // Motorcycle-only regions
-    wire obs_moto_helmet = !obstacle_is_car &&
-                           (obs_row_rel >= obs_top) &&
-                           (obs_row_rel <= obs_top + $signed({1'b0, obs_band_h}) - 11'sd1);
+    // ---------------- Motorcycle-only regions ----------------
+    // Helmet: small and centered, narrower than the rider's shoulders.
+    wire [9:0] obs_moto_helmet_w = (obs_half_w > (obs_half_w >> 2)) ? (obs_half_w - (obs_half_w >> 2)) : 10'd1;
+    wire obs_moto_helmet = !obstacle_is_car && obs_band0 &&
+                          (obs_col_rel >= -$signed({1'b0, obs_moto_helmet_w})) &&
+                          (obs_col_rel <=  $signed({1'b0, obs_moto_helmet_w}));
 
-    wire [9:0] obs_moto_light_w = (obs_half_w > 10'd1) ? (obs_half_w >> 1) : 10'd1;
-    wire obs_moto_taillight = !obstacle_is_car &&
-                              (obs_row_rel >= obs_bot - 11'sd1) &&
-                              (obs_row_rel <= obs_bot) &&
+    // Shoulders/back: full box width -- the widest part of the rider.
+    wire obs_moto_shoulders = !obstacle_is_car && obs_band1;
+
+    // Seat/bike body: narrows back in below the rider.
+    wire [9:0] obs_moto_seat_w = (obs_half_w > 10'd1) ? (obs_half_w >> 1) : 10'd1;
+    wire obs_moto_seat = !obstacle_is_car && obs_band2 &&
+                        (obs_col_rel >= -$signed({1'b0, obs_moto_seat_w})) &&
+                        (obs_col_rel <=  $signed({1'b0, obs_moto_seat_w}));
+
+    // Rear wheel fills the bottom band; a small brake light sits on
+    // top of it (checked first below, so it wins where the two touch).
+    wire [9:0] obs_moto_wheel_w = (obs_half_w > 10'd1) ? (obs_half_w >> 1) : 10'd1;
+    wire obs_moto_wheel = !obstacle_is_car && obs_band3 &&
+                         (obs_col_rel >= -$signed({1'b0, obs_moto_wheel_w})) &&
+                         (obs_col_rel <=  $signed({1'b0, obs_moto_wheel_w}));
+
+    wire [9:0] obs_moto_light_w = (obs_half_w > 10'd2) ? (obs_half_w >> 2) : 10'd1;
+    wire obs_moto_taillight = !obstacle_is_car && obs_band3 &&
+                              (obs_row_off < (obs_half_hgt + obs_quarter_h) + (obs_quarter_h >> 1)) &&
                               (obs_col_rel >= -$signed({1'b0, obs_moto_light_w})) &&
                               (obs_col_rel <=  $signed({1'b0, obs_moto_light_w}));
 
@@ -1790,7 +2332,8 @@ localparam CAR_W = 10'd128;
     wire signed [10:0] car_top_s    = $signed({1'b0, CAR_Y}) + $signed({1'b0, CAR_HITBOX_MARGIN_TOP});
     wire signed [10:0] car_bottom_s = $signed({1'b0, CAR_Y}) + $signed({1'b0, CAR_H}) - $signed({1'b0, CAR_HITBOX_MARGIN_BOTTOM});
 
-    wire obstacle_car_overlap = (obs_left_s   < car_right_s) && (obs_right_s  > car_left_s) &&
+    wire obstacle_car_overlap = obstacle_active &&
+                                (obs_left_s   < car_right_s) && (obs_right_s  > car_left_s) &&
                                 (obs_top_s    < car_bottom_s) && (obs_bottom_s > car_top_s);
 
     // Rising edge only -- obstacle_overlap_prev holds last frame's
@@ -1820,6 +2363,193 @@ localparam CAR_W = 10'd128;
     wire bonus_collision_edge = bonus_car_overlap && !bonus_overlap_prev;
     wire bonus_reached_end    = bonus_active && ((bonus_y + OBSTACLE_SPEED) >= OBS_Y_END);
 
+    // ==================================================================
+    // ================== FITUR BARU: kumpulan wire ====================
+    // Semua identifier yang dipakai di sini (CAR_X, shimmer_phase,
+    // car_left_s, wrap_ty, curve_shift_at, dst.) sudah dideklarasikan
+    // lebih atas, jadi blok ini aman diletakkan di satu tempat.
+    // ==================================================================
+
+    // ---------------- Rival / traffic: perspektif & lajur -------------
+    // Salinan persis pipeline milik obstacle, hanya untuk rival_y/lane.
+    wire [9:0] dy_rival                     = rival_y - 10'd120;
+    wire signed [13:0] curve_shift_rival    = curve_shift_at(curve_amount, dy_rival);
+    wire signed [13:0] center_x_rival_signed = $signed({1'b0, ROAD_CENTER_X}) + curve_shift_rival;
+    wire [9:0] road_half_rival              = ROAD_HALF_FAR + (dy_rival >> 1);
+
+    wire signed [10:0] rival_lane_offset = (rival_lane == 2'd0) ? -$signed({1'b0, road_half_rival}) >>> 1 :
+                                            (rival_lane == 2'd2) ?  $signed({1'b0, road_half_rival}) >>> 1 :
+                                                                     11'sd0;
+
+    wire signed [10:0] rival_x_signed = center_x_rival_signed + rival_lane_offset;
+    wire [9:0] rival_x = clamp_center_x(rival_x_signed, 10'd25);
+
+    wire [9:0] riv_half_w = OBS_BASE_HALF_W + (dy_rival >> OBS_SCALE_SHIFT) + 10'd2; // selalu mobil
+    wire [9:0] riv_half_h = OBS_BASE_HALF_H + (dy_rival >> OBS_SCALE_SHIFT);
+
+    wire signed [10:0] riv_col_rel = $signed({1'b0, x}) - $signed({1'b0, rival_x});
+    wire signed [10:0] riv_row_rel = $signed({1'b0, y}) - $signed({1'b0, rival_y});
+
+    // Balik lagi jadi siluet mobil (bukan bintang) supaya jalanan
+    // kelihatan lebih padat -- bintang cukup dipakai buat pickup saja.
+    wire is_rival_area = rival_active &&
+                         (riv_col_rel >= -$signed({1'b0, riv_half_w})) && (riv_col_rel <= $signed({1'b0, riv_half_w})) &&
+                         (riv_row_rel >= -$signed({1'b0, riv_half_h})) && (riv_row_rel <= $signed({1'b0, riv_half_h}));
+
+    // Band silhouette yang sama dengan obstacle mobil (atap / kaca /
+    // bodi / bumper), cukup subset-nya saja.
+    wire signed [10:0] riv_row_off_s = riv_row_rel + $signed({1'b0, riv_half_h});
+    wire [9:0] riv_row_off   = riv_row_off_s[9:0];
+    wire [9:0] riv_quarter_h = (riv_half_h > 10'd1) ? (riv_half_h >> 1) : 10'd1;
+    wire [9:0] riv_half_hgt  = (riv_half_h > 10'd0) ? riv_half_h        : 10'd1;
+
+    wire riv_band0 = riv_row_off <  riv_quarter_h;
+    wire riv_band1 = (riv_row_off >= riv_quarter_h) && (riv_row_off < riv_half_hgt);
+    wire riv_band3 = riv_row_off >= (riv_half_hgt + riv_quarter_h);
+
+    wire [9:0] riv_roof_w  = (riv_half_w > (riv_half_w >> 2)) ? (riv_half_w - (riv_half_w >> 2)) : 10'd1;
+    wire [9:0] riv_win_w   = (riv_half_w > 10'd1) ? (riv_half_w >> 1) : 10'd1;
+    wire [9:0] riv_light_w = (riv_half_w > 10'd3) ? (riv_half_w >> 2) : 10'd1;
+    wire [9:0] riv_plate_w = (riv_half_w > 10'd2) ? (riv_half_w >> 2) : 10'd1;
+
+    wire riv_roof = riv_band0 &&
+                    (riv_col_rel >= -$signed({1'b0, riv_roof_w})) &&
+                    (riv_col_rel <=  $signed({1'b0, riv_roof_w}));
+    wire riv_window = riv_band1 &&
+                      (riv_col_rel >= -$signed({1'b0, riv_win_w})) &&
+                      (riv_col_rel <=  $signed({1'b0, riv_win_w}));
+    wire riv_plate = riv_band3 &&
+                     (riv_col_rel >= -$signed({1'b0, riv_plate_w})) &&
+                     (riv_col_rel <=  $signed({1'b0, riv_plate_w}));
+    wire riv_taillight = riv_band3 &&
+                         (((riv_col_rel <= -$signed({1'b0, riv_half_w}) + $signed({1'b0, riv_light_w}))) ||
+                          ((riv_col_rel >=  $signed({1'b0, riv_half_w}) - $signed({1'b0, riv_light_w}))));
+
+    // ---------------- Rival: kotak tabrakan & tepi -------------------
+    wire signed [10:0] riv_left_s   = $signed({1'b0, rival_x}) - $signed({1'b0, riv_half_w});
+    wire signed [10:0] riv_right_s  = $signed({1'b0, rival_x}) + $signed({1'b0, riv_half_w});
+    wire signed [10:0] riv_top_s    = $signed({1'b0, rival_y}) - $signed({1'b0, riv_half_h});
+    wire signed [10:0] riv_bottom_s = $signed({1'b0, rival_y}) + $signed({1'b0, riv_half_h});
+
+    wire rival_car_overlap = rival_active &&
+                             (riv_left_s   < car_right_s)  && (riv_right_s  > car_left_s) &&
+                             (riv_top_s    < car_bottom_s) && (riv_bottom_s > car_top_s);
+
+    wire rival_collision_edge = rival_car_overlap && !rival_overlap_prev;
+    wire rival_reached_end    = rival_active && ((rival_y + RIVAL_SPEED) >= OBS_Y_END);
+
+    // Pilih lajur rival dari fold bit LFSR yang BERBEDA dengan pemilih
+    // lajur obstacle; kalau kebetulan sama dengan lajur obstacle yang
+    // sedang aktif, geser satu lajur supaya tidak spawn menumpuk.
+    wire [1:0] rival_lane_raw   = obstacle_rand[4:3] ^ obstacle_rand[7:6];
+    wire [1:0] rival_lane_pick0 = (rival_lane_raw == 2'd3) ? 2'd0 : rival_lane_raw;
+    wire [1:0] rival_lane_pick  = (rival_lane_pick0 == obstacle_lane)
+                                  ? ((rival_lane_pick0 == 2'd2) ? 2'd0 : (rival_lane_pick0 + 2'd1))
+                                  : rival_lane_pick0;
+
+    // ---------------- Near-miss: kotak obstacle diperlebar ------------
+    wire obstacle_near_overlap = obstacle_active &&
+                                 (obs_left_s   - $signed({1'b0, NEAR_MARGIN_W}) < car_right_s)  &&
+                                 (obs_right_s  + $signed({1'b0, NEAR_MARGIN_W}) > car_left_s)   &&
+                                 (obs_top_s    - $signed({1'b0, NEAR_MARGIN_H}) < car_bottom_s) &&
+                                 (obs_bottom_s + $signed({1'b0, NEAR_MARGIN_H}) > car_top_s);
+
+    // Roll tipe pickup berikutnya (bintang nyawa vs nitro) dari bit LFSR
+    // lain lagi supaya tidak berkorelasi dengan lajur/tipe kendaraan.
+    wire next_is_nitro = obstacle_rand[6] ^ obstacle_rand[0];
+
+    // ---------------- Landmark: menara jam di distrik kota ------------
+    // Satu instance saja, digambar manual (bukan lewat building_at)
+    // supaya tingginya tidak dibatasi input 5-bit fungsi itu -- menara
+    // ini sengaja jauh lebih tinggi dari gedung biasa di sekitarnya.
+    wire landmark_on = in_city_zone && landmark_active;
+
+    localparam [9:0] LM_BASE_SY = TREE_Y_MIN + 10'd95;
+
+    wire [9:0] lm_sy    = wrap_ty(LM_BASE_SY, scroll_y);
+    wire [9:0] lm_dy    = lm_sy - TREE_Y_MIN;
+    wire [9:0] lm_rhalf = ROAD_HALF_FAR + (lm_dy >> 1);
+
+    wire signed [13:0] lm_cshift = curve_shift_at(curve_amount, lm_dy);
+    wire signed [13:0] lm_censig = $signed({1'b0, ROAD_CENTER_X}) + lm_cshift;
+    wire [9:0] lm_center = clamp_center_x(lm_censig, 10'd5);
+
+    wire [9:0] lm_half   = 10'd8 + (lm_dy >> 4);                         // lebih lebar dari gedung biasa
+    wire [9:0] lm_height = (lm_half << 1) + (lm_half >> 1) + 10'd12;     // ~2.5x lebarnya + 12 -> menjulang
+    wire [9:0] lm_sx     = lm_center - lm_rhalf - TREE_GAP - SCEN_BASE_GAP - 10'd8 - lm_half;
+
+    wire [9:0] lm_wall_top = lm_sy - lm_height;
+    wire [9:0] lm_dx       = (x >= lm_sx) ? (x - lm_sx) : (lm_sx - x);
+    wire       lm_is_lit   = (x < lm_sx);
+
+    wire lm_in_body = landmark_on && (y >= 10'd120) &&
+                      (y >= lm_wall_top) && (y <= lm_sy) && (lm_dx <= lm_half);
+
+    // Muka jam: belah ketupat terang dekat puncak menara, dengan cincin
+    // gelap tipis + titik poros di tengah (|dx| + |dy| <= r, tanpa kali).
+    wire [9:0] lm_clock_cy = lm_wall_top + lm_half + 10'd4;
+    wire [9:0] lm_cdy      = (y >= lm_clock_cy) ? (y - lm_clock_cy) : (lm_clock_cy - y);
+    wire [9:0] lm_clock_r  = (lm_half > 10'd3) ? (lm_half - 10'd2) : 10'd1;
+    wire [10:0] lm_cdist   = {1'b0, lm_dx} + {1'b0, lm_cdy};
+
+    wire lm_clock_face = lm_in_body && (lm_cdist <= {1'b0, lm_clock_r});
+    wire lm_clock_ring = lm_clock_face && (lm_cdist + 11'd2 > {1'b0, lm_clock_r});
+    wire lm_clock_dot  = lm_in_body && (lm_cdist <= 11'd1);
+
+    wire lm_roof_px = lm_in_body && (y < lm_wall_top + 10'd3);
+    // Jendela grid yang sama idiomnya dengan building_at, hanya di
+    // bagian menara DI BAWAH jamnya. Baris grid dihitung relatif ke
+    // puncak menara (bukan koordinat layar mentah) supaya jendelanya
+    // ikut menggeser bersama menara saat dunia scroll.
+    wire [9:0] lm_ly = y - lm_wall_top;
+    wire lm_window = lm_in_body && (y > lm_clock_cy + lm_clock_r + 10'd2) && (y < lm_sy - 10'd2) &&
+                     (lm_dx[2:0] < 3'd2) && (lm_dx < lm_half - 10'd1) &&
+                     (lm_ly[2:0] < 3'd2);
+
+    // ---------------- Hujan: garis diagonal jatuh ---------------------
+    // Kolom garis dipilih hash bit murah (idiom speckle yang sama);
+    // pola disampel di (y - rain_scroll) sehingga garis tampak jatuh ke
+    // bawah, dengan kemiringan x + (y >> 3).
+    wire [9:0] rain_yy = y - rain_scroll;
+    wire [9:0] rain_xx = x + (y >> 3);
+    wire [4:0] rain_col_hash = rain_xx[4:0] ^ {rain_xx[7:6], rain_xx[8], 2'b00};
+    wire rain_streak = rain_active && (rain_col_hash[4:1] == 4'd0) && (rain_yy[4:0] < 5'd18);
+
+    // ---------------- Debu belok tajam --------------------------------
+    // Bintik cokelat-abu kecil di sisi belakang-bawah mobil yang
+    // BERLAWANAN arah gerak -- hanya saat tombol setir ditahan.
+    wire dust_time_ok = game_started && !game_over && (steer_left ^ steer_right);
+    wire dust_band    = (y >= CAR_Y + CAR_H - 10'd22) && (y < CAR_Y + CAR_H + 10'd2);
+    wire dust_side    = (steer_right && (x >= CAR_X + 10'd4)  && (x < CAR_X + 10'd30)) ||
+                        (steer_left  && (x >= CAR_X + CAR_W - 10'd30) && (x < CAR_X + CAR_W - 10'd4));
+    wire dust_pattern = (x[1] ^ anim_y[1] ^ shimmer_phase[0]) & (x[3] ^ anim_y[2]);
+    wire dust_pixel   = dust_time_ok && dust_band && dust_side && dust_pattern;
+
+    // ---------------- Api nitro di belakang mobil ---------------------
+    wire nitro_flame_area = nitro_active && game_started && !game_over &&
+                            (y >= CAR_Y + CAR_H - 10'd4) && (y < CAR_Y + CAR_H + 10'd10) &&
+                            (x >= CAR_X + 10'd38) && (x < CAR_X + CAR_W - 10'd38);
+    wire nitro_flame_hot  = (x[2] ^ y[1] ^ shimmer_phase[0]); // selang-seling kuning/oranye berkedip
+
+    // ---------------- Confetti perayaan milestone ---------------------
+    // Titik warna-warni tersebar yang bergeser tiap frame lewat
+    // shimmer_phase -- hanya selama celebrate_timer berjalan.
+    wire confetti_on = (celebrate_timer != 5'd0);
+    wire confetti_px = confetti_on &&
+                       (((x[4:0] ^ y[4:0] ^ shimmer_phase[4:0]) == 5'd0) ||
+                        ((x[4:0] + y[4:0] + shimmer_phase[4:0]) == 6'd7));
+
+    // ---------------- Piksel yang tetap terang saat malam -------------
+    // Jendela/lampu/pickup/mobil pemain tidak ikut digelapkan di kota
+    // malam, supaya "jendela gedung nyala terang" benar-benar kontras.
+    wire night_keep_bright = building_window || market_window || market_sign || house_window ||
+                             lm_clock_face || lm_window ||
+                             is_bonus_area ||
+                             (is_obstacle_area && (obs_car_taillight || obs_moto_taillight)) ||
+                             (is_rival_area && riv_taillight) ||
+                             (is_car_area && car_rgb != 24'hFFFFFF) ||
+                             (nitro_flame_area && nitro_flame_hot);
+
     // Points awarded each time an obstacle is successfully dodged
     // (reaches the end of the road without a collision this frame).
     localparam [15:0] POINTS_PER_DODGE = 16'd10;
@@ -1843,10 +2573,12 @@ localparam CAR_W = 10'd128;
     always @(posedge clk) begin
         if (reset) begin
             obstacle_y            <= OBS_Y_START;
-            obstacle_lane         <= 2'd1;
+            obstacle_lane         <= 2'd0;
             obstacle_is_car       <= 1'b1;
             obstacle_rand         <= 8'hA5;   // non-zero seed -- an all-zero LFSR would stay stuck at 0 forever
             obstacle_overlap_prev <= 1'b0;
+            obstacle_active       <= 1'b1;    // obstacle pertama langsung tampil begitu game mulai
+            obstacle_spawn_timer  <= 16'd0;
             collision             <= 1'b0;
             score                 <= 16'd0;
             game_over              <= 1'b0;
@@ -1857,6 +2589,14 @@ localparam CAR_W = 10'd128;
             bonus_lane             <= 2'd1;
             bonus_overlap_prev     <= 1'b0;
             bonus_spawn_timer      <= BONUS_SPAWN_INTERVAL;
+            bonus_is_nitro         <= 1'b0;
+            nitro_timer            <= 16'd0;
+            rival_active           <= 1'b0;
+            rival_y                <= OBS_Y_START;
+            rival_lane             <= 2'd0;
+            rival_overlap_prev     <= 1'b0;
+            rival_spawn_timer      <= RIVAL_SPAWN_INTERVAL;
+            near_miss_latch        <= 1'b0;
         end else if (x == 10'd0 && y == 10'd0 && game_started) begin   // sekali per frame, tapi cuma setelah start ditekan
             // 8-bit maximal-length Fibonacci LFSR (taps 8,6,5,4).
             // Advancing this by a fixed number of steps each respawn
@@ -1865,7 +2605,14 @@ localparam CAR_W = 10'd128;
             obstacle_rand <= {obstacle_rand[6:0],
                                obstacle_rand[7] ^ obstacle_rand[5] ^ obstacle_rand[4] ^ obstacle_rand[3]};
             obstacle_overlap_prev <= obstacle_car_overlap;
-            collision <= collision_edge;
+            rival_overlap_prev    <= rival_car_overlap;
+            // Pulse collision keluar-modul sekarang mencakup tabrakan
+            // dengan traffic/rival juga, bukan hanya rintangan.
+            collision <= collision_edge || rival_collision_edge;
+
+            // Timer nitro turun sekali per frame, berhenti sendiri di 0.
+            if (nitro_timer != 16'd0)
+                nitro_timer <= nitro_timer - 16'd1;
 
             if (!game_over) begin
                 // A crash costs one life AND some points (which also
@@ -1885,20 +2632,39 @@ localparam CAR_W = 10'd128;
                     end
                 end else if (obstacle_reached_end) begin
                     // Made it past this obstacle without hitting it --
-                    // award points (base + current combo bonus) and
+                    // award points (base + current combo bonus, plus
+                    // extra kalau lewatnya "mepet"/near-miss) and
                     // extend the streak by one.
-                    score       <= score + POINTS_PER_DODGE + combo_bonus;
+                    score       <= score + POINTS_PER_DODGE + combo_bonus
+                                   + (near_miss_latch ? NEAR_MISS_BONUS : 16'd0);
                     combo_count <= combo_count + 8'd1;
                 end
 
-                // A fresh hit respawns the obstacle immediately (looks like
-                // it "shattered" on impact, and guarantees the next frame's
-                // overlap is false so we can't re-trigger on the same box).
+                // Latch near-miss: kotak-lebar menyentuh mobil tapi kotak
+                // asli tidak -> dodge kali ini tercatat "mepet". Di-clear
+                // lagi di respawn di bawah.
+                if (obstacle_near_overlap && !obstacle_car_overlap)
+                    near_miss_latch <= 1'b1;
+
+                // Sebuah tabrakan / berhasil dilewati membuat obstacle
+                // non-aktif dulu selama OBSTACLE_SPAWN_GAP frame -- jeda
+                // "napas" ini yang bikin ada jarak ke musuh berikutnya,
+                // bukan langsung respawn di frame yang sama seperti
+                // sebelumnya (jeda 0 = kelihatan mepet/numpuk).
                 if (collision_edge || obstacle_reached_end) begin
-                    obstacle_y            <= OBS_Y_START;
-                    obstacle_lane         <= next_lane;
-                    obstacle_is_car       <= next_is_car;
-                    obstacle_overlap_prev <= 1'b0;
+                    obstacle_active        <= 1'b0;
+                    obstacle_spawn_timer   <= OBSTACLE_SPAWN_GAP;
+                    obstacle_overlap_prev  <= 1'b0;
+                    near_miss_latch        <= 1'b0;   // mulai bersih untuk obstacle berikutnya
+                end else if (!obstacle_active) begin
+                    if (obstacle_spawn_timer <= 16'd1) begin
+                        obstacle_active  <= 1'b1;
+                        obstacle_y       <= OBS_Y_START;
+                        obstacle_lane    <= obstacle_next_lane;
+                        obstacle_is_car  <= next_is_car;
+                    end else begin
+                        obstacle_spawn_timer <= obstacle_spawn_timer - 16'd1;
+                    end
                 end else begin
                     obstacle_y <= obstacle_y + OBSTACLE_SPEED;
                 end
@@ -1918,7 +2684,12 @@ localparam CAR_W = 10'd128;
                     if (bonus_collision_edge) begin
                         bonus_active       <= 1'b0;
                         bonus_spawn_timer  <= BONUS_SPAWN_INTERVAL;
-                        if (lives < LIVES_MAX)
+                        if (bonus_is_nitro) begin
+                            // NITRO: dorongan kecepatan sementara + bonus
+                            // skor langsung -- nyawa tidak berubah.
+                            nitro_timer <= NITRO_DURATION;
+                            score       <= score + NITRO_PICKUP_SCORE;
+                        end else if (lives < LIVES_MAX)
                             lives <= lives + 3'd1;
                     end else if (bonus_reached_end) begin
                         bonus_active      <= 1'b0;
@@ -1931,9 +2702,54 @@ localparam CAR_W = 10'd128;
                         bonus_active           <= 1'b1;
                         bonus_y                <= OBS_Y_START;
                         bonus_lane             <= next_lane; // reuses the obstacle LFSR's lane pick -- already decorrelated from the obstacle's own spawn timing
+                        bonus_is_nitro         <= next_is_nitro; // roll tipe pickup: bintang nyawa atau nitro
                         bonus_overlap_prev     <= 1'b0;
                     end else begin
                         bonus_spawn_timer <= bonus_spawn_timer - 16'd1;
+                    end
+                end
+
+                // ------------------------------------------------------
+                // Traffic / rival: diletakkan SETELAH logika obstacle &
+                // pickup di atas dengan sengaja -- kalau dua event
+                // menyentuh register yang sama di frame yang sama
+                // (sangat jarang), assignment nonblocking terakhir
+                // (milik rival) yang menang, dan prioritas "tabrakan
+                // dihukum" memang yang kita mau.
+                // ------------------------------------------------------
+                if (rival_active) begin
+                    if (rival_collision_edge) begin
+                        // Menabrak mobil lain = sama beratnya dengan
+                        // menabrak rintangan: combo putus, skor dipotong,
+                        // nyawa berkurang (nyawa terakhir -> game over).
+                        combo_count  <= 8'd0;
+                        score        <= (score >= LIFE_LOST_PENALTY) ? (score - LIFE_LOST_PENALTY) : 16'd0;
+                        if (lives <= 3'd1) begin
+                            lives     <= 3'd0;
+                            game_over <= 1'b1;
+                        end else begin
+                            lives <= lives - 3'd1;
+                        end
+                        rival_active      <= 1'b0;
+                        rival_spawn_timer <= RIVAL_SPAWN_INTERVAL;
+                    end else if (rival_reached_end) begin
+                        // Berhasil DISALIP: bonus poin menyalip + streak
+                        // combo ikut memanjang -- rasa "balapan sungguhan".
+                        score        <= score + POINTS_PER_OVERTAKE + combo_bonus;
+                        combo_count  <= combo_count + 8'd1;
+                        rival_active      <= 1'b0;
+                        rival_spawn_timer <= RIVAL_SPAWN_INTERVAL;
+                    end else begin
+                        rival_y <= rival_y + RIVAL_SPEED;
+                    end
+                end else begin
+                    if (rival_spawn_timer <= 16'd1) begin
+                        rival_active       <= 1'b1;
+                        rival_y            <= OBS_Y_START;
+                        rival_lane         <= rival_lane_pick;
+                        rival_overlap_prev <= 1'b0;
+                    end else begin
+                        rival_spawn_timer <= rival_spawn_timer - 16'd1;
                     end
                 end
             end
@@ -1974,6 +2790,74 @@ localparam CAR_W = 10'd128;
                 fade_level <= fade_level + FADE_STEP;
             else if (fade_level > fade_target)
                 fade_level <= fade_level - FADE_STEP;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Feedback visual per-frame: semua counter kecil di bawah ini hanya
+    // MEWARNAI (di blok mux warna), tidak menyentuh state permainan --
+    // sengaja dipisah dari blok skor/rintangan supaya mudah di-tune.
+    //  * hit_flash        : layar berkilat merah sesaat setelah menabrak
+    //  * nm_flash         : kilatan emas singkat saat dodge "mepet"
+    //  * celebrate_timer  : hujan confetti tiap skor lewat kelipatan 1000
+    //  * rain_scroll      : fase jatuh garis-garis hujan
+    //  * lightning_flash  : kilatan petir putih-kebiruan sesaat saat hujan
+    // ------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (reset) begin
+            hit_flash          <= 4'd0;
+            nm_flash           <= 4'd0;
+            celebrate_timer    <= 5'd0;
+            milestone_target   <= MILESTONE_STEP;
+            rain_scroll        <= 10'd0;
+            lightning_flash    <= 4'd0;
+            lightning_cooldown <= 10'd90;
+        end else if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
+            // Flash merah: langsung penuh saat ada tabrakan (rintangan
+            // ATAU traffic), lalu meluruh 1 step per frame.
+            if (game_started && !game_over && (collision_edge || rival_collision_edge))
+                hit_flash <= 4'd12;
+            else if (hit_flash != 4'd0)
+                hit_flash <= hit_flash - 4'd1;
+
+            // Kilatan emas: hanya saat obstacle sukses dilewati DAN
+            // tercatat near-miss (bukan saat menabrak).
+            if (game_started && !game_over && obstacle_reached_end &&
+                near_miss_latch && !collision_edge)
+                nm_flash <= 4'd8;
+            else if (nm_flash != 4'd0)
+                nm_flash <= nm_flash - 4'd1;
+
+            // Milestone skor: sekali skor menembus target, rayakan lalu
+            // geser target ke kelipatan berikutnya.
+            if (score >= milestone_target) begin
+                celebrate_timer  <= 5'd28;
+                milestone_target <= milestone_target + MILESTONE_STEP;
+            end else if (celebrate_timer != 5'd0) begin
+                celebrate_timer <= celebrate_timer - 5'd1;
+            end
+
+            // Garis hujan jatuh ~10 px per frame (hanya efek visual,
+            // jalan terus meski hujan sedang tidak aktif -- murah).
+            rain_scroll <= rain_scroll + 10'd10;
+
+            // Petir: sekali cooldown habis DAN hujan sedang aktif, tiap
+            // frame punya peluang kecil (1/8, dari 3 bit obstacle_rand
+            // yang sudah jalan sebagai LFSR di blok lain) untuk menyambar
+            // -- jadi jeda antar sambaran terasa acak, bukan berdetak
+            // teratur. Cooldown baru diisi ulang dari sisa bit LFSR supaya
+            // jarak ke sambaran berikutnya juga bervariasi (+120..+375
+            // frame, kira-kira 2-6 detik pada 60fps).
+            if (lightning_cooldown != 10'd0)
+                lightning_cooldown <= lightning_cooldown - 10'd1;
+
+            if (lightning_cooldown == 10'd0 && rain_active &&
+                (obstacle_rand[2:0] == 3'd0)) begin
+                lightning_flash    <= 4'd14;
+                lightning_cooldown <= {2'b0, obstacle_rand} + 10'd120;
+            end else if (lightning_flash != 4'd0) begin
+                lightning_flash <= lightning_flash - 4'd1;
+            end
         end
     end
 
@@ -2425,6 +3309,28 @@ localparam CAR_W = 10'd128;
          blue  = car_rgb[7:0];
      end
 
+        else if (nitro_flame_area) begin
+            // Semburan api nitro di belakang mobil: selang-seling
+            // kuning/oranye yang berkedip lewat shimmer_phase.
+            if (nitro_flame_hot) begin
+                red   = 8'd255;
+                green = 8'd220;
+                blue  = 8'd80;
+            end else begin
+                red   = 8'd255;
+                green = 8'd130;
+                blue  = 8'd30;
+            end
+        end
+
+        else if (dust_pixel) begin
+            // Partikel debu cokelat-abu di sisi belakang mobil saat
+            // menikung/menggeser tajam.
+            red   = 8'd150;
+            green = 8'd135;
+            blue  = 8'd118;
+        end
+
         else if (is_obstacle_area) begin
             if (obstacle_is_car) begin
                 if (obs_car_window) begin
@@ -2433,10 +3339,22 @@ localparam CAR_W = 10'd128;
                     green = 8'd40;
                     blue  = 8'd50;
                 end else if (obs_car_taillight) begin
-                    // Bright taillights.
+                    // Bright taillights, corners of the bumper band.
                     red   = 8'd250;
                     green = 8'd40;
                     blue  = 8'd35;
+                end else if (obs_car_plate) begin
+                    // Pale license plate, centered in the bumper band.
+                    red   = 8'd225;
+                    green = 8'd215;
+                    blue  = 8'd175;
+                end else if (obs_car_roof) begin
+                    // Roof -- a shade darker than the body so the
+                    // greenhouse reads as its own panel, not just a
+                    // narrower patch of the same color.
+                    red   = 8'd140;
+                    green = 8'd28;
+                    blue  = 8'd28;
                 end else begin
                     // Car body.
                     red   = 8'd175;
@@ -2444,22 +3362,60 @@ localparam CAR_W = 10'd128;
                     blue  = 8'd35;
                 end
             end else begin
-                if (obs_moto_helmet) begin
-                    // Rider's helmet.
-                    red   = 8'd25;
-                    green = 8'd25;
-                    blue  = 8'd30;
-                end else if (obs_moto_taillight) begin
-                    // Taillight.
+                if (obs_moto_taillight) begin
+                    // Brake light, sits on top of the rear wheel.
                     red   = 8'd250;
                     green = 8'd40;
                     blue  = 8'd35;
-                end else begin
-                    // Body/seat.
-                    red   = 8'd55;
+                end else if (obs_moto_helmet) begin
+                    // Rider's helmet -- sedikit lebih cerah dari sebelumnya.
+                    red   = 8'd60;
                     green = 8'd60;
                     blue  = 8'd70;
+                end else if (obs_moto_wheel) begin
+                    // Rear wheel/tire -- abu-abu gelap, sedikit lebih
+                    // cerah supaya tidak "near-black" lagi.
+                    red   = 8'd60;
+                    green = 8'd60;
+                    blue  = 8'd65;
+                end else if (obs_moto_shoulders) begin
+                    // Rider's jacket, full width across the shoulders.
+                    red   = 8'd105;
+                    green = 8'd115;
+                    blue  = 8'd150;
+                end else begin
+                    // Seat/bike body.
+                    red   = 8'd100;
+                    green = 8'd105;
+                    blue  = 8'd120;
                 end
+            end
+        end
+
+        else if (is_rival_area) begin
+            // Mobil traffic/rival: bodi BIRU supaya sekilas langsung
+            // terbedakan dari rintangan merah -- ini kendaraan yang
+            // berjalan searah dan bisa disalip.
+            if (riv_window) begin
+                red   = 8'd30;
+                green = 8'd38;
+                blue  = 8'd55;
+            end else if (riv_taillight) begin
+                red   = 8'd250;
+                green = 8'd50;
+                blue  = 8'd40;
+            end else if (riv_plate) begin
+                red   = 8'd225;
+                green = 8'd215;
+                blue  = 8'd175;
+            end else if (riv_roof) begin
+                red   = 8'd40;
+                green = 8'd80;
+                blue  = 8'd160;
+            end else begin
+                red   = 8'd55;
+                green = 8'd105;
+                blue  = 8'd200;
             end
         end
 
@@ -2468,10 +3424,14 @@ localparam CAR_W = 10'd128;
                 red   = 8'd255;
                 green = 8'd255;
                 blue  = 8'd230;   // bright near-white core
+            end else if (bonus_is_nitro) begin
+                red   = 8'd50;
+                green = 8'd200;
+                blue  = 8'd255;   // pickup NITRO: cyan menyala, jelas beda dari bintang nyawa
             end else begin
                 red   = 8'd255;
                 green = 8'd205;
-                blue  = 8'd40;    // gold sparkle body
+                blue  = 8'd40;    // gold sparkle body (bintang +1 nyawa)
             end
         end
 
@@ -2479,6 +3439,25 @@ localparam CAR_W = 10'd128;
 			red   = {bg_pixel[11:8], bg_pixel[11:8]};
 			green = {bg_pixel[7:4],  bg_pixel[7:4]};
 			blue  = {bg_pixel[3:0],  bg_pixel[3:0]};
+            if (in_night_zone) begin
+                // Kota malam: langit yang sama diredupkan separuh dengan
+                // sisa rona biru, plus taburan bintang kecil di langit
+                // bagian atas (hash bit murah, idiom speckle biasa).
+                red   = {1'b0, red[7:1]};
+                green = {1'b0, green[7:1]};
+                blue  = {1'b0, blue[7:1]} + {3'b0, blue[7:3]};
+                if ((y < 10'd80) &&
+                    ((x[4:0] ^ y[4:0] ^ {x[7:5], y[6:5]}) == 5'd0)) begin
+                    red   = 8'd230;
+                    green = 8'd230;
+                    blue  = 8'd255;   // bintang
+                end
+            end else if (in_snow_zone) begin
+                // Zona salju: langit dipucatkan ke arah putih kabut.
+                red   = blend4(red,   8'd245, 4'd5);
+                green = blend4(green, 8'd248, 4'd5);
+                blue  = blend4(blue,  8'd252, 4'd5);
+            end
 		  end
 
         else begin
@@ -2535,29 +3514,51 @@ localparam CAR_W = 10'd128;
             end
 
             else if (tree_canopy_outline) begin
-                // Thin dark rim around the canopy so it reads as a
-                // distinct rounded shape instead of a flat blob melting
-                // into the sky/grass behind it.
-                terrain_r = 8'd22;
-                terrain_g = 8'd45;
-                terrain_b = 8'd55;
+                if (in_snow_zone) begin
+                    // Zona salju: tepi kerucut cemara jadi "rim salju"
+                    // putih -- pohonnya terlihat tertutup salju tipis.
+                    terrain_r = 8'd235;
+                    terrain_g = 8'd242;
+                    terrain_b = 8'd248;
+                end else begin
+                    // Thin dark rim around the canopy so it reads as a
+                    // distinct rounded shape instead of a flat blob melting
+                    // into the sky/grass behind it.
+                    terrain_r = 8'd22;
+                    terrain_g = 8'd45;
+                    terrain_b = 8'd55;
+                end
             end
 
             else if (tree_canopy_lit) begin
-                // Lit side (fixed "light from the left"): cooler
-                // teal-green, brighter half of the canopy.
-                terrain_r = 8'd62;
-                terrain_g = 8'd118;
-                terrain_b = 8'd130;
+                if (in_snow_zone) begin
+                    // Cemara: hijau pinus gelap, sisi terang.
+                    terrain_r = 8'd38;
+                    terrain_g = 8'd92;
+                    terrain_b = 8'd66;
+                end else begin
+                    // Lit side (fixed "light from the left"): cooler
+                    // teal-green, brighter half of the canopy.
+                    terrain_r = 8'd62;
+                    terrain_g = 8'd118;
+                    terrain_b = 8'd130;
+                end
             end
 
             else if (tree_canopy_shadow) begin
-                // Shadow side: same teal-green family, just darker --
-                // this split is what actually gives the canopy some
-                // roundness instead of looking like a flat disc.
-                terrain_r = 8'd40;
-                terrain_g = 8'd82;
-                terrain_b = 8'd96;
+                if (in_snow_zone) begin
+                    // Cemara: sisi bayangan, hijau pinus lebih gelap lagi.
+                    terrain_r = 8'd24;
+                    terrain_g = 8'd62;
+                    terrain_b = 8'd46;
+                end else begin
+                    // Shadow side: same teal-green family, just darker --
+                    // this split is what actually gives the canopy some
+                    // roundness instead of looking like a flat disc.
+                    terrain_r = 8'd40;
+                    terrain_g = 8'd82;
+                    terrain_b = 8'd96;
+                end
             end
 
             else if (tree_trunk_lit) begin
@@ -2591,6 +3592,11 @@ localparam CAR_W = 10'd128;
                     terrain_r = 8'd170;
                     terrain_g = 8'd225;
                     terrain_b = 8'd235;
+                end else if (in_snow_zone) begin
+                    // Zona salju: kolam membeku -- es biru sangat pucat.
+                    terrain_r = 8'd190;
+                    terrain_g = 8'd220;
+                    terrain_b = 8'd235;
                 end else begin
                     // Lit face (fixed "light from the left"): brighter
                     // reflective teal-blue.
@@ -2601,11 +3607,18 @@ localparam CAR_W = 10'd128;
             end
 
             else if (pond_water_shadow) begin
-                // Shadow face: deeper, darker water -- gives the pond
-                // some depth instead of a flat blob of blue.
-                terrain_r = 8'd35;
-                terrain_g = 8'd90;
-                terrain_b = 8'd120;
+                if (in_snow_zone) begin
+                    // Es sisi bayangan, tetap pucat tapi lebih teduh.
+                    terrain_r = 8'd150;
+                    terrain_g = 8'd185;
+                    terrain_b = 8'd205;
+                end else begin
+                    // Shadow face: deeper, darker water -- gives the pond
+                    // some depth instead of a flat blob of blue.
+                    terrain_r = 8'd35;
+                    terrain_g = 8'd90;
+                    terrain_b = 8'd120;
+                end
             end
 
             else if (person_torso) begin
@@ -2643,11 +3656,138 @@ localparam CAR_W = 10'd128;
                 terrain_b = 8'd26;
             end
 
+            // ---- Landmark menara jam: hanya muncul tiap kunjungan kota
+            // ke-3 (landmark_active). Diperiksa sebelum gedung biasa
+            // supaya menaranya selalu "menang" di piksel yang sama.
+            else if (lm_clock_dot || lm_clock_ring) begin
+                // Cincin & poros jarum jam -- gelap di atas muka krem.
+                terrain_r = 8'd40;
+                terrain_g = 8'd32;
+                terrain_b = 8'd30;
+            end
+
+            else if (lm_clock_face) begin
+                // Muka jam krem terang, ikon paling mencolok di menara.
+                terrain_r = 8'd245;
+                terrain_g = 8'd240;
+                terrain_b = 8'd215;
+            end
+
+            else if (lm_window) begin
+                // Jendela menara, hangat menyala seperti gedung lain.
+                terrain_r = 8'd255;
+                terrain_g = 8'd210;
+                terrain_b = 8'd110;
+            end
+
+            else if (lm_roof_px) begin
+                // Tepi atap menara, gelap.
+                terrain_r = 8'd70;
+                terrain_g = 8'd45;
+                terrain_b = 8'd45;
+            end
+
+            else if (lm_in_body) begin
+                // Dinding bata merah -- warna yang sengaja BEDA dari
+                // beton abu gedung biasa, supaya terbaca sebagai
+                // "gedung spesial" dari kejauhan.
+                if (lm_is_lit) begin
+                    terrain_r = 8'd170;
+                    terrain_g = 8'd80;
+                    terrain_b = 8'd70;
+                end else begin
+                    terrain_r = 8'd122;
+                    terrain_g = 8'd56;
+                    terrain_b = 8'd50;
+                end
+            end
+
+            else if (market_sign) begin
+                // Bright red/white awning band -- reads as a convenience-
+                // store sign from a distance, distinct from the office
+                // towers around it.
+                terrain_r = 8'd220;
+                terrain_g = 8'd48;
+                terrain_b = 8'd56;
+            end
+
+            else if (market_door) begin
+                // Glass door, cool tinted.
+                terrain_r = 8'd120;
+                terrain_g = 8'd170;
+                terrain_b = 8'd200;
+            end
+
+            else if (market_window) begin
+                // Big bright storefront window.
+                terrain_r = 8'd200;
+                terrain_g = 8'd230;
+                terrain_b = 8'd245;
+            end
+
+            else if (market_roof) begin
+                // Flat concrete roof edge.
+                terrain_r = 8'd150;
+                terrain_g = 8'd140;
+                terrain_b = 8'd130;
+            end
+
+            else if (market_wall_lit) begin
+                // Cheerful painted storefront wall, lit side.
+                terrain_r = 8'd235;
+                terrain_g = 8'd200;
+                terrain_b = 8'd140;
+            end
+
+            else if (market_wall_shadow) begin
+                // Storefront wall, shadow side.
+                terrain_r = 8'd178;
+                terrain_g = 8'd148;
+                terrain_b = 8'd100;
+            end
+
+            else if (building_window) begin
+                // Lit office window -- warm amber glow against the cool
+                // concrete, so the towers look inhabited/alive at night.
+                terrain_r = 8'd255;
+                terrain_g = 8'd210;
+                terrain_b = 8'd110;
+            end
+
+            else if (building_roof) begin
+                // Flat rooftop parapet ledge.
+                terrain_r = 8'd90;
+                terrain_g = 8'd94;
+                terrain_b = 8'd102;
+            end
+
+            else if (building_wall_lit) begin
+                // Concrete/glass curtain wall, lit side.
+                terrain_r = 8'd160;
+                terrain_g = 8'd168;
+                terrain_b = 8'd180;
+            end
+
+            else if (building_wall_shadow) begin
+                // Curtain wall, shadow side -- cooler and darker so the
+                // tower reads with real volume instead of flat grey.
+                terrain_r = 8'd104;
+                terrain_g = 8'd112;
+                terrain_b = 8'd126;
+            end
+
             else if (house_roof) begin
-                // Dark brick-red roof.
-                terrain_r = 8'd140;
-                terrain_g = 8'd58;
-                terrain_b = 8'd48;
+                if (in_snow_zone) begin
+                    // Zona salju: atap rumah tertutup salju putih.
+                    terrain_r = 8'd232;
+                    terrain_g = 8'd238;
+                    terrain_b = 8'd246;
+                end else begin
+                    // Dark brick-red roof.
+                    terrain_r = 8'd140;
+                    terrain_g = 8'd58;
+                    terrain_b = 8'd48;
+                end
             end
 
             else if (house_door) begin
@@ -2706,6 +3846,70 @@ localparam CAR_W = 10'd128;
                 terrain_b = 8'd112;
             end
 
+            else if (billboard_stripe) begin
+                // Pita aksen kuning di tengah papan -- biar kebaca sebagai
+                // "ada isinya" (kayak judul iklan), bukan kotak polos.
+                terrain_r = 8'd245;
+                terrain_g = 8'd205;
+                terrain_b = 8'd60;
+            end
+
+            else if (billboard_face) begin
+                // Warna dasar papan iklan -- merah cerah biar kontras
+                // sama rumput/langit di belakangnya.
+                terrain_r = 8'd210;
+                terrain_g = 8'd60;
+                terrain_b = 8'd50;
+            end
+
+            else if (billboard_frame) begin
+                // Bingkai gelap di tepi papan.
+                terrain_r = 8'd35;
+                terrain_g = 8'd35;
+                terrain_b = 8'd38;
+            end
+
+            else if (billboard_pole_lit) begin
+                // Tiang besi, sisi terang.
+                terrain_r = 8'd150;
+                terrain_g = 8'd150;
+                terrain_b = 8'd155;
+            end
+
+            else if (billboard_pole_shadow) begin
+                // Tiang besi, sisi bayangan.
+                terrain_r = 8'd95;
+                terrain_g = 8'd95;
+                terrain_b = 8'd100;
+            end
+
+            else if (in_city_zone) begin
+                // City district ground: 4 close, subtle grey paving-slab
+                // shades using the exact same speckle bits as the grass
+                // case below -- so the sidewalk reads as a distinct city
+                // material rather than a green field with buildings
+                // dropped on top of it. (Peredupan versi MALAM dilakukan
+                // global setelah blok ini, bukan di sini.)
+                case ({grass_speck_a, grass_speck_b})
+                    2'b00: begin terrain_r = 8'd96;  terrain_g = 8'd96;  terrain_b = 8'd100; end
+                    2'b01: begin terrain_r = 8'd104; terrain_g = 8'd104; terrain_b = 8'd108; end
+                    2'b10: begin terrain_r = 8'd112; terrain_g = 8'd112; terrain_b = 8'd116; end
+                    default: begin terrain_r = 8'd120; terrain_g = 8'd120; terrain_b = 8'd124; end
+                endcase
+            end
+
+            else if (in_snow_zone) begin
+                // Zona pegunungan salju: hamparan salju putih dengan 4
+                // gradasi tipis kebiruan -- speckle bit yang sama dengan
+                // rumput, hanya palet-nya diganti.
+                case ({grass_speck_a, grass_speck_b})
+                    2'b00: begin terrain_r = 8'd222; terrain_g = 8'd230; terrain_b = 8'd240; end
+                    2'b01: begin terrain_r = 8'd230; terrain_g = 8'd237; terrain_b = 8'd246; end
+                    2'b10: begin terrain_r = 8'd238; terrain_g = 8'd244; terrain_b = 8'd250; end
+                    default: begin terrain_r = 8'd246; terrain_g = 8'd250; terrain_b = 8'd254; end
+                endcase
+            end
+
             else begin
                 // Grass: 4 close, subtle teal-green shades picked
                 // per-pixel by grass_speck_a/b, instead of one flat
@@ -2724,14 +3928,77 @@ localparam CAR_W = 10'd128;
             // above this column into the flat terrain color computed
             // above. Everything further down the screen is untouched.
             if (in_horizon_blend) begin
-                red   = blend4(horizon_r, terrain_r, horizon_blend_w);
-                green = blend4(horizon_g, terrain_g, horizon_blend_w);
-                blue  = blend4(horizon_b, terrain_b, horizon_blend_w);
+                red   = blend4(horizon_r_eff, terrain_r, horizon_blend_w);
+                green = blend4(horizon_g_eff, terrain_g, horizon_blend_w);
+                blue  = blend4(horizon_b_eff, terrain_b, horizon_blend_w);
             end else begin
                 red   = terrain_r;
                 green = terrain_g;
                 blue  = terrain_b;
             end
+        end
+
+        // ---- Kota MALAM: seluruh scene di bawah horizon diredupkan
+        // separuh dengan sisa rona biru dingin -- KECUALI piksel yang
+        // memang sumber cahaya (jendela gedung/rumah, papan minimarket,
+        // muka jam menara, lampu rem, pickup, mobil pemain, api nitro;
+        // lihat night_keep_bright). Langit (y<120) sudah diredupkan di
+        // cabangnya sendiri, jadi tidak diproses dua kali di sini.
+        if (video_on && in_night_zone && (y >= 10'd120) && !night_keep_bright) begin
+            red   = {1'b0, red[7:1]};
+            green = {1'b0, green[7:1]};
+            blue  = {1'b0, blue[7:1]} + {3'b0, blue[7:3]};
+        end
+
+        // ---- Hujan: langit mendung (seluruh layar ditarik sedikit ke
+        // abu-abu) + garis-garis diagonal jatuh. Digambar sebelum flash/
+        // confetti/fade supaya tetap terbaca sebagai bagian dari dunia.
+        if (video_on && rain_active) begin
+            red   = blend4(red,   8'd95,  4'd3);
+            green = blend4(green, 8'd100, 4'd3);
+            blue  = blend4(blue,  8'd112, 4'd3);
+            if (rain_streak) begin
+                red   = blend4(red,   8'd175, 4'd8);
+                green = blend4(green, 8'd195, 4'd8);
+                blue  = blend4(blue,  8'd225, 4'd8);
+            end
+        end
+
+        // ---- Petir: sambaran cepat mencerahkan seluruh layar ke arah
+        // putih-kebiruan sesaat, hanya bisa muncul saat hujan aktif.
+        // Meluruh cepat (14 -> 0 dalam 14 frame) supaya terasa seperti
+        // kilatan sungguhan, bukan lampu yang menyala lama.
+        if (video_on && lightning_flash != 4'd0) begin
+            red   = blend4(red,   8'd235, lightning_flash);
+            green = blend4(green, 8'd240, lightning_flash);
+            blue  = blend4(blue,  8'd255, lightning_flash);
+        end
+
+        // ---- Flash merah tabrakan: seketika kuat lalu meluruh --
+        // umpan balik "aduh, kena!" yang jelas tanpa mengubah gameplay.
+        if (video_on && hit_flash != 4'd0) begin
+            red   = blend4(red,   8'd255, hit_flash);
+            green = blend4(green, 8'd30,  hit_flash);
+            blue  = blend4(blue,  8'd30,  hit_flash);
+        end
+
+        // ---- Kilatan emas near-miss: lebih lembut dari flash merah,
+        // hadiah visual untuk dodge yang mepet.
+        if (video_on && nm_flash != 4'd0) begin
+            red   = blend4(red,   8'd255, nm_flash);
+            green = blend4(green, 8'd215, nm_flash);
+            blue  = blend4(blue,  8'd80,  {1'b0, nm_flash[3:1]});
+        end
+
+        // ---- Confetti milestone: taburan titik warna-warni yang
+        // berganti posisi tiap frame selama perayaan skor kelipatan 1000.
+        if (video_on && confetti_px) begin
+            case ({x[6] ^ shimmer_phase[1], y[6] ^ shimmer_phase[2]})
+                2'b00:  begin red = 8'd255; green = 8'd90;  blue = 8'd120; end // pink
+                2'b01:  begin red = 8'd255; green = 8'd215; blue = 8'd60;  end // emas
+                2'b10:  begin red = 8'd90;  green = 8'd220; blue = 8'd120; end // hijau
+                default:begin red = 8'd110; green = 8'd170; blue = 8'd255; end // biru
+            endcase
         end
 
         // ---- Screen fade: applied to the scene we just computed
