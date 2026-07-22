@@ -25,20 +25,69 @@ module render_static (
     // game_over (every world-state always block below checks BOTH
     // !game_over and game_started), so this reuses that pattern rather
     // than adding a whole separate code path.
+    //
+    // A short 3-2-1-GO countdown now sits between "start pressed" and
+    // "game_started actually goes high" -- game_started (and therefore
+    // every world-state block gated on it) stays frozen for the whole
+    // countdown, then goes high exactly once the countdown finishes, so
+    // no other always block in this file needs to know the countdown
+    // exists at all.
     // ------------------------------------------------------------------
     reg game_started;
     reg start_btn_prev;
-    initial game_started   = 1'b0;
-    initial start_btn_prev = 1'b0;
+    reg countdown_active;
+    reg [1:0] countdown_num;            // counts 3,2,1
+    reg [5:0] countdown_frame_counter;  // frames elapsed within the current number
+    reg [5:0] go_banner_timer;          // purely visual "GO!" flash right after countdown ends
+
+    localparam [5:0] COUNTDOWN_FRAMES_PER_NUM = 6'd60; // ~1 detik per angka @60fps
+    localparam [5:0] GO_BANNER_FRAMES         = 6'd30; // ~0.5 detik "GO!"
+
+    initial game_started            = 1'b0;
+    initial start_btn_prev          = 1'b0;
+    initial countdown_active        = 1'b0;
+    initial countdown_num           = 2'd3;
+    initial countdown_frame_counter = 6'd0;
+    initial go_banner_timer         = 6'd0;
 
     always @(posedge clk) begin
         if (reset) begin
-            game_started   <= 1'b0;
-            start_btn_prev <= 1'b0;
+            game_started            <= 1'b0;
+            start_btn_prev          <= 1'b0;
+            countdown_active        <= 1'b0;
+            countdown_num           <= 2'd3;
+            countdown_frame_counter <= 6'd0;
+            go_banner_timer         <= 6'd0;
         end else if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
             start_btn_prev <= start_btn;
-            if (!game_started && start_btn && !start_btn_prev)
-                game_started <= 1'b1;
+
+            if (go_banner_timer != 6'd0)
+                go_banner_timer <= go_banner_timer - 6'd1;
+
+            if (!game_started && !countdown_active && start_btn && !start_btn_prev) begin
+                // Start pressed: don't flip game_started yet -- kick off
+                // the countdown instead. World state stays frozen the
+                // whole time since it's still gated on game_started.
+                countdown_active        <= 1'b1;
+                countdown_num           <= 2'd3;
+                countdown_frame_counter <= 6'd0;
+            end else if (countdown_active) begin
+                if (countdown_frame_counter >= COUNTDOWN_FRAMES_PER_NUM - 6'd1) begin
+                    countdown_frame_counter <= 6'd0;
+                    if (countdown_num <= 2'd1) begin
+                        // "1" just finished -- countdown done, game
+                        // actually starts now, and we flash "GO!" for a
+                        // short moment on top of live gameplay.
+                        countdown_active <= 1'b0;
+                        game_started     <= 1'b1;
+                        go_banner_timer  <= GO_BANNER_FRAMES;
+                    end else begin
+                        countdown_num <= countdown_num - 2'd1;
+                    end
+                end else begin
+                    countdown_frame_counter <= countdown_frame_counter + 6'd1;
+                end
+            end
         end
     end
 
@@ -191,6 +240,17 @@ module render_static (
     initial landmark_active  = 1'b0;
     initial weather_cycle    = 3'd0;
 
+    // ------------------------------------------------------------------
+    // Zone badge popup: fires a short on-screen "AREA n" badge the
+    // instant zone_id changes, so the automatic distance-based scenery
+    // swap (village/city/snow/night) reads as an explicit, noticed
+    // event instead of scenery quietly drifting past. Purely a display
+    // timer -- doesn't gate or delay anything else in this block.
+    // ------------------------------------------------------------------
+    reg [6:0] zone_badge_timer;
+    initial zone_badge_timer = 7'd0;
+    localparam [6:0] ZONE_BADGE_FRAMES = 7'd90; // ~1.5 detik @60fps
+
     always @(posedge clk) begin
         if (reset) begin
             zone_dist        <= 20'd0;
@@ -198,11 +258,16 @@ module render_static (
             city_visit_count <= 2'd0;
             landmark_active  <= 1'b0;
             weather_cycle    <= 3'd0;
+            zone_badge_timer <= 7'd0;
         end else if (x == 10'd0 && y == 10'd0 && !game_over && game_started) begin
+            if (zone_badge_timer != 7'd0)
+                zone_badge_timer <= zone_badge_timer - 7'd1;
+
             if (zone_dist + world_scroll_speed >= ZONE_LENGTH) begin
                 zone_dist <= (zone_dist + world_scroll_speed) - ZONE_LENGTH;
                 zone_id   <= zone_id + 2'd1;   // wrap 0,1,2,3,0,... otomatis
                 weather_cycle <= weather_cycle + 3'd1; // wrap 0..7 otomatis
+                zone_badge_timer <= ZONE_BADGE_FRAMES;
                 // Zona BERIKUTNYA adalah kota kalau zone_id sekarang genap
                 // (0->1 dan 2->3 sama-sama masuk kota). Hitung kunjungan
                 // kota di sini supaya landmark_active sudah final tepat
@@ -224,6 +289,22 @@ module render_static (
     // Jadwal hujan: aktif di 2 dari 8 pergantian zona (tidak berurutan),
     // jadi cuaca berubah berkala tanpa perlu RNG/logic baru yang berat.
     wire rain_active = (weather_cycle == 3'd2) || (weather_cycle == 3'd5);
+
+    // ------------------------------------------------------------------
+    // Distance-traveled odometer: accumulates world_scroll_speed every
+    // frame while actually playing, same gating as scroll_y. Reset by
+    // `reset` (it's a per-run counter, shown on the in-game HUD -- see
+    // the "distance HUD" block further down, near the score panel).
+    // ------------------------------------------------------------------
+    reg [23:0] distance_traveled;
+    initial distance_traveled = 24'd0;
+
+    always @(posedge clk) begin
+        if (reset)
+            distance_traveled <= 24'd0;
+        else if (x == 10'd0 && y == 10'd0 && !game_over && game_started)
+            distance_traveled <= distance_traveled + {14'd0, world_scroll_speed};
+    end
 
     // ------------------------------------------------------------------
     // Clamps a curved center-x to whatever range keeps a box of the
@@ -712,6 +793,178 @@ module render_static (
             if (tp_left[ti] == 3'b011 || tp_right[ti] == 3'b011) tree_canopy_outline = 1'b1;
             if (tp_left[ti] == 3'b100 || tp_right[ti] == 3'b100) tree_trunk_lit      = 1'b1;
             if (tp_left[ti] == 3'b101 || tp_right[ti] == 3'b101) tree_trunk_shadow   = 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Street lights ("PJU tenaga surya"): a slim pole, a short arm that
+    // bends over toward the road with the lamp head hanging off the tip
+    // (like a shepherd's hook, not a big glowing ball centered on the
+    // pole), and a small solar panel mounted partway up. Much smaller
+    // footprint than the first attempt -- the glow radius here is fixed
+    // per-instance instead of growing with distance, so it never balloons
+    // into a giant blob up close.
+    //
+    // bend_dir: 1 = arm/lamp/panel reach toward +x (used for poles on
+    // the LEFT of the road, so the lamp leans in over the road), 0 =
+    // reach toward -x (poles on the RIGHT).
+    //
+    // Returns: 3'b001 = pole lit, 3'b010 = pole shadow, 3'b011 = arm,
+    //          3'b100 = lamp housing, 3'b101 = lamp glow,
+    //          3'b110 = solar panel, 3'b000 = none
+    // ------------------------------------------------------------------
+    function [2:0] streetlight_at;
+        input [9:0] px, py;    // pixel under test
+        input [9:0] lx, ly;    // pole position: x center, y = ground/base
+        input [4:0] pw;        // pole width
+        input [5:0] ph;        // pole height (wider than pw -- tiang jauh lebih tinggi drpd lebar)
+        input       bend_dir;  // 1 = lean +x, 0 = lean -x
+        reg   [9:0] pole_top_y;
+        reg   [9:0] arm_len, arm_th;
+        reg   [9:0] lamp_w, lamp_h, lamp_cx, lamp_cy;
+        reg   [9:0] panel_w, panel_h, panel_x0, panel_y0;
+        reg   [9:0] glow_cx, glow_cy, gdx, gdy;
+        reg   [4:0] glow_r;
+        reg   [19:0] gdist2, glow_r2;
+        reg          is_lit;
+        begin
+            pole_top_y = ly - {4'd0, ph};
+
+            // Arm: short, roughly a quarter of the pole's height, thin.
+            arm_len = ({4'd0, ph} >> 2 < 10'd3) ? 10'd3 : ({4'd0, ph} >> 2);
+            arm_th  = (pw > 5'd1) ? {5'd0, pw} : 10'd1;
+
+            // Lamp head hangs just below the far end of the arm.
+            lamp_w  = arm_th + 10'd3;
+            lamp_h  = arm_th + 10'd1;
+            lamp_cx = bend_dir ? (lx + arm_len) : (lx - arm_len);
+            lamp_cy = pole_top_y + (arm_th >> 1) + 10'd2;
+
+            // Small fixed-size warm glow under the lamp -- doesn't scale
+            // up with distance, so it never turns into a giant blob.
+            glow_cx = lamp_cx;
+            glow_cy = lamp_cy + (lamp_h >> 1) + 10'd1;
+            glow_r  = (pw > 5'd3) ? 5'd3 : 5'd2;
+            gdx = (px >= glow_cx) ? (px - glow_cx) : (glow_cx - px);
+            gdy = (py >= glow_cy) ? (py - glow_cy) : (glow_cy - py);
+            gdist2  = gdx * gdx + gdy * gdy;
+            glow_r2 = {15'd0, glow_r} * {15'd0, glow_r};
+
+            // Small solar panel mounted on the pole, just under the arm,
+            // same side as the lean -- flat rectangle kept deliberately
+            // small (it's a detail, not the main silhouette).
+            panel_w  = (arm_len > 10'd2) ? (arm_len - 10'd2) : 10'd2;
+            panel_h  = (arm_th > 10'd1) ? (arm_th - 10'd1) : 10'd1;
+            panel_x0 = bend_dir ? lx : (lx - panel_w);
+            panel_y0 = pole_top_y + arm_th + 10'd2;
+
+            is_lit = (px < lx); // sama seperti pohon/rumah -- "cahaya dari kiri" tetap
+
+            if (gdist2 <= glow_r2) begin
+                streetlight_at = 3'b101; // cahaya lampu, kecil & tetap (tidak membesar)
+            end else if ((px >= lamp_cx - (lamp_w >> 1)) && (px <= lamp_cx + (lamp_w >> 1)) &&
+                         (py >= lamp_cy - (lamp_h >> 1)) && (py <= lamp_cy + (lamp_h >> 1))) begin
+                streetlight_at = 3'b100; // rumah lampu
+            end else if (bend_dir ?
+                         ((px >= lx) && (px <= lx + arm_len) &&
+                          (py >= pole_top_y - (arm_th >> 1)) && (py <= pole_top_y + (arm_th >> 1))) :
+                         ((px <= lx) && (px >= lx - arm_len) &&
+                          (py >= pole_top_y - (arm_th >> 1)) && (py <= pole_top_y + (arm_th >> 1)))) begin
+                streetlight_at = 3'b011; // lengan tiang
+            end else if ((px >= panel_x0) && (px <= panel_x0 + panel_w) &&
+                         (py >= panel_y0) && (py <= panel_y0 + panel_h)) begin
+                streetlight_at = 3'b110; // panel surya
+            end else if ((px >= lx - {5'd0, pw >> 1}) && (px <= lx + {5'd0, pw >> 1}) &&
+                         (py >= pole_top_y) && (py <= ly)) begin
+                streetlight_at = is_lit ? 3'b001 : 3'b010; // tiang lit/shadow
+            end else
+                streetlight_at = 3'b000;
+        end
+    endfunction
+
+    localparam NUM_LIGHTS_SIDE      = 4;  // sedikit saja -- tetap ringan disintesis, seperti pohon
+    localparam [9:0] LIGHT_Y_MIN    = TREE_Y_MIN;
+    localparam [9:0] LIGHT_Y_MAX    = TREE_Y_MAX;
+    localparam [9:0] LIGHT_Y_STEP   = (LIGHT_Y_MAX - LIGHT_Y_MIN) / NUM_LIGHTS_SIDE;
+    localparam [9:0] LIGHT_PHASE_OFFSET = LIGHT_Y_STEP >> 2; // beda fase dari pohon, biar tidak sejajar terus
+    localparam [9:0] LIGHT_GAP       = 10'd1;  // dekat aspal, dan (lihat this_pw di bawah) selalu punya jarak aman ke TREE_GAP
+    localparam [9:0] LIGHT_BASE_HALF = 10'd1;  // lebar tiang di horizon -- ramping
+    localparam       LIGHT_SCALE_SHIFT = 5;    // tumbuh lebih lambat daripada pohon -- tetap kecil
+
+    wire [2:0] lp_left  [0:NUM_LIGHTS_SIDE-1];
+    wire [2:0] lp_right [0:NUM_LIGHTS_SIDE-1];
+
+    generate
+        for (gi = 0; gi < NUM_LIGHTS_SIDE; gi = gi + 1) begin : gen_left_light
+            localparam [9:0] base_ly = LIGHT_Y_MIN + (LIGHT_Y_STEP >> 1) + gi * LIGHT_Y_STEP;
+
+            wire [9:0] this_ly    = wrap_ty(base_ly, scroll_y);
+            wire [9:0] this_dy    = this_ly - LIGHT_Y_MIN;
+            wire [9:0] this_half  = LIGHT_BASE_HALF + (this_dy >> LIGHT_SCALE_SHIFT);
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            // Tiang ramping: tinggi = 5x lebar (shift+add, bukan pembagian)
+            // supaya rasio tetap seperti tiang lampu sungguhan, bukan kotak gemuk.
+            wire [9:0] this_ph    = (this_half << 2) + this_half;
+
+            // Lebar tiang DIKUNCI kecil (tidak ikut membesar seperti
+            // this_half) -- ini yang tadinya bikin tiang bisa "menimpa"
+            // pohon: this_half dipakai juga untuk jarak-dari-jalan, jadi
+            // makin dekat kamera tiang makin lebar DAN makin menjorok
+            // keluar, sampai menembus zona TREE_GAP tempat pohon mulai.
+            // Dengan lebar dikunci <=2px, tiang+jaraknya selalu tetap di
+            // dalam celah aman (LIGHT_GAP + this_pw jauh di bawah
+            // TREE_GAP), berapa pun besar this_half untuk tinggi/lengan.
+            wire [9:0] this_pw    = (this_half > 10'd2) ? 10'd2 : this_half;
+
+            wire signed [13:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_lx = this_center - this_rhalf - LIGHT_GAP - this_pw;
+
+            // Sisi kiri jalan -> lengan/lampu menjorok ke kanan (ke arah jalan).
+            assign lp_left[gi] = streetlight_at(x, y, this_lx, this_ly,
+                                                 this_pw[4:0], this_ph[5:0], 1'b1);
+        end
+
+        for (gi = 0; gi < NUM_LIGHTS_SIDE; gi = gi + 1) begin : gen_right_light
+            localparam [9:0] base_ly = LIGHT_Y_MIN + (LIGHT_Y_STEP >> 1) + LIGHT_PHASE_OFFSET + gi * LIGHT_Y_STEP;
+
+            wire [9:0] this_ly    = wrap_ty(base_ly, scroll_y);
+            wire [9:0] this_dy    = this_ly - LIGHT_Y_MIN;
+            wire [9:0] this_half  = LIGHT_BASE_HALF + (this_dy >> LIGHT_SCALE_SHIFT);
+            wire [9:0] this_rhalf = ROAD_HALF_FAR + (this_dy >> 1);
+            wire [9:0] this_ph    = (this_half << 2) + this_half;
+            wire [9:0] this_pw    = (this_half > 10'd2) ? 10'd2 : this_half;
+
+            wire signed [13:0] this_cshift  = curve_shift_at(curve_amount, this_dy);
+            wire signed [13:0] this_censig  = $signed({1'b0, ROAD_CENTER_X}) + this_cshift;
+            wire [9:0] this_center = clamp_center_x(this_censig, 10'd5);
+
+            wire [9:0] this_lx = this_center + this_rhalf + LIGHT_GAP + this_pw;
+
+            // Sisi kanan jalan -> lengan/lampu menjorok ke kiri (ke arah jalan).
+            assign lp_right[gi] = streetlight_at(x, y, this_lx, this_ly,
+                                                  this_pw[4:0], this_ph[5:0], 1'b0);
+        end
+    endgenerate
+
+    reg light_pole_lit, light_pole_shadow, light_arm, light_lamp_housing, light_glow, light_panel;
+    integer li;
+    always @(*) begin
+        light_pole_lit      = 1'b0;
+        light_pole_shadow   = 1'b0;
+        light_arm           = 1'b0;
+        light_lamp_housing  = 1'b0;
+        light_glow          = 1'b0;
+        light_panel         = 1'b0;
+        for (li = 0; li < NUM_LIGHTS_SIDE; li = li + 1) begin
+            if (lp_left[li] == 3'b001 || lp_right[li] == 3'b001) light_pole_lit     = 1'b1;
+            if (lp_left[li] == 3'b010 || lp_right[li] == 3'b010) light_pole_shadow  = 1'b1;
+            if (lp_left[li] == 3'b011 || lp_right[li] == 3'b011) light_arm          = 1'b1;
+            if (lp_left[li] == 3'b100 || lp_right[li] == 3'b100) light_lamp_housing = 1'b1;
+            if (lp_left[li] == 3'b101 || lp_right[li] == 3'b101) light_glow         = 1'b1;
+            if (lp_left[li] == 3'b110 || lp_right[li] == 3'b110) light_panel        = 1'b1;
         end
     end
 
@@ -1935,7 +2188,7 @@ localparam CAR_W = 10'd128;
     // from catching the star pickup (see below) instead of an automatic
     // score threshold. Each hit costs one life AND LIFE_LOST_PENALTY
     // points (which also naturally lowers obstacle_speed_bonus/
-    // difficulty since that's derived straight from `score` -- no
+    // difficulty since that's derived straight from `score`) -- no
     // separate "slow back down" logic needed, it falls out of the
     // existing difficulty formula for free). Only the hit that takes
     // the LAST life actually sets game_over. Widened to 3 bits (was 2)
@@ -2046,6 +2299,25 @@ localparam CAR_W = 10'd128;
     reg [9:0]  rain_scroll;      // fase jatuh garis hujan
     reg [3:0]  lightning_flash;    // bobot blend putih-kebiruan sambaran petir
     reg [9:0]  lightning_cooldown; // frame tersisa sebelum sambaran berikutnya diizinkan
+
+    // ------------------------------------------------------------------
+    // Screen shake: a couple of frames of small +-px jitter applied
+    // ONLY to the persistent HUD panels (score/high-score/lives/
+    // distance -- see x_hud/y_hud below), kicked off the instant a
+    // crash happens, decaying fast just like hit_flash. Kept to the
+    // HUD rather than the whole 3D scene on purpose: shaking the road/
+    // car/obstacles would mean threading a shifted sample point through
+    // every single geometry function in this file, which is a huge,
+    // risky refactor for a pure "juice" effect -- shaking the HUD next
+    // to the red flash still reads as a solid "hit" kick with none of
+    // that risk.
+    // ------------------------------------------------------------------
+    reg signed [2:0] shake_offset_x, shake_offset_y;
+    reg [3:0]        shake_timer;
+    initial shake_offset_x = 3'sd0;
+    initial shake_offset_y = 3'sd0;
+    initial shake_timer    = 4'd0;
+
     initial hit_flash        = 4'd0;
     initial nm_flash         = 4'd0;
     initial celebrate_timer  = 5'd0;
@@ -2570,6 +2842,22 @@ localparam CAR_W = 10'd128;
     wire [15:0] combo_bonus_raw = {8'd0, combo_count} * COMBO_BONUS_STEP;
     wire [15:0] combo_bonus     = (combo_bonus_raw > COMBO_BONUS_CAP) ? COMBO_BONUS_CAP : combo_bonus_raw;
 
+    // ------------------------------------------------------------------
+    // Run recap: remembers the score from the run that just ended
+    // (last_run_score) and whether the player has completed at least
+    // one run yet (has_played_once), so the next START screen can show
+    // "last run vs. best" instead of popping back to a bare START
+    // banner. Neither register is cleared by `reset` on its own (they
+    // only change value inside the gameplay always block below, at the
+    // exact moment a crash takes the last life) -- that's what lets
+    // them survive the reset that happens right after a game over and
+    // still be there to show on the following START screen.
+    // ------------------------------------------------------------------
+    reg [15:0] last_run_score;
+    reg        has_played_once;
+    initial last_run_score  = 16'd0;
+    initial has_played_once = 1'b0;
+
     always @(posedge clk) begin
         if (reset) begin
             obstacle_y            <= OBS_Y_START;
@@ -2625,8 +2913,10 @@ localparam CAR_W = 10'd128;
                     score       <= (score >= LIFE_LOST_PENALTY) ? (score - LIFE_LOST_PENALTY) : 16'd0;
 
                     if (lives <= 3'd1) begin
-                        lives     <= 3'd0;
-                        game_over <= 1'b1;
+                        lives           <= 3'd0;
+                        game_over       <= 1'b1;
+                        last_run_score  <= score; // catat skor sesaat sebelum penalti tabrakan terakhir ini
+                        has_played_once <= 1'b1;
                     end else begin
                         lives <= lives - 3'd1;
                     end
@@ -2725,8 +3015,10 @@ localparam CAR_W = 10'd128;
                         combo_count  <= 8'd0;
                         score        <= (score >= LIFE_LOST_PENALTY) ? (score - LIFE_LOST_PENALTY) : 16'd0;
                         if (lives <= 3'd1) begin
-                            lives     <= 3'd0;
-                            game_over <= 1'b1;
+                            lives           <= 3'd0;
+                            game_over       <= 1'b1;
+                            last_run_score  <= score;
+                            has_played_once <= 1'b1;
                         end else begin
                             lives <= lives - 3'd1;
                         end
@@ -2802,6 +3094,7 @@ localparam CAR_W = 10'd128;
     //  * celebrate_timer  : hujan confetti tiap skor lewat kelipatan 1000
     //  * rain_scroll      : fase jatuh garis-garis hujan
     //  * lightning_flash  : kilatan petir putih-kebiruan sesaat saat hujan
+    //  * shake_offset_x/y : goyangan singkat pada panel HUD sesaat tabrakan
     // ------------------------------------------------------------------
     always @(posedge clk) begin
         if (reset) begin
@@ -2812,6 +3105,9 @@ localparam CAR_W = 10'd128;
             rain_scroll        <= 10'd0;
             lightning_flash    <= 4'd0;
             lightning_cooldown <= 10'd90;
+            shake_timer        <= 4'd0;
+            shake_offset_x     <= 3'sd0;
+            shake_offset_y     <= 3'sd0;
         end else if (x == 10'd0 && y == 10'd0) begin   // sekali per frame
             // Flash merah: langsung penuh saat ada tabrakan (rintangan
             // ATAU traffic), lalu meluruh 1 step per frame.
@@ -2819,6 +3115,25 @@ localparam CAR_W = 10'd128;
                 hit_flash <= 4'd12;
             else if (hit_flash != 4'd0)
                 hit_flash <= hit_flash - 4'd1;
+
+            // Screen/HUD shake: kicked off the same instant as the red
+            // flash, decays over ~10 frames. Direction re-rolled every
+            // frame from LFSR bits so it jitters back and forth instead
+            // of sliding smoothly in one direction; magnitude shrinks
+            // as shake_timer counts down (shake_timer[3:2] halves twice
+            // over the decay window).
+            if (game_started && !game_over && (collision_edge || rival_collision_edge))
+                shake_timer <= 4'd10;
+            else if (shake_timer != 4'd0)
+                shake_timer <= shake_timer - 4'd1;
+
+            if (shake_timer != 4'd0) begin
+                shake_offset_x <= (obstacle_rand[1] ? 3'sd1 : -3'sd1) * $signed({1'b0, shake_timer[3:2]});
+                shake_offset_y <= (obstacle_rand[3] ? 3'sd1 : -3'sd1) * $signed({1'b0, shake_timer[3:2]});
+            end else begin
+                shake_offset_x <= 3'sd0;
+                shake_offset_y <= 3'sd0;
+            end
 
             // Kilatan emas: hanya saat obstacle sukses dilewati DAN
             // tercatat near-miss (bukan saat menabrak).
@@ -2915,7 +3230,8 @@ localparam CAR_W = 10'd128;
 
     // ---- 5x7 font: returns a 5-bit row pattern (MSB = leftmost pixel)
     // for a given character code and row (0..6). chsel: 0-9 = digits,
-    // 10=G 11=A 12=M 13=E 14=O 15=V 16=R 17=space 18=H 19=I.
+    // 10=G 11=A 12=M 13=E 14=O 15=V 16=R 17=space 18=H 19=I 20=S 21=T
+    // 22=L 23=B 24=D.
     function [4:0] glyph_row;
         input [4:0] chsel;
         input [2:0] row;
@@ -3006,6 +3322,18 @@ localparam CAR_W = 10'd128;
                     3'd0: r=5'b11111; 3'd1: r=5'b00100; 3'd2: r=5'b00100; 3'd3: r=5'b00100;
                     3'd4: r=5'b00100; 3'd5: r=5'b00100; 3'd6: r=5'b00100; default: r=5'b00000;
                     endcase
+                5'd22: case(row) // 'L'
+                    3'd0: r=5'b10000; 3'd1: r=5'b10000; 3'd2: r=5'b10000; 3'd3: r=5'b10000;
+                    3'd4: r=5'b10000; 3'd5: r=5'b10000; 3'd6: r=5'b11111; default: r=5'b00000;
+                    endcase
+                5'd23: case(row) // 'B'
+                    3'd0: r=5'b11110; 3'd1: r=5'b10001; 3'd2: r=5'b10001; 3'd3: r=5'b11110;
+                    3'd4: r=5'b10001; 3'd5: r=5'b10001; 3'd6: r=5'b11110; default: r=5'b00000;
+                    endcase
+                5'd24: case(row) // 'D'
+                    3'd0: r=5'b11110; 3'd1: r=5'b10001; 3'd2: r=5'b10001; 3'd3: r=5'b10001;
+                    3'd4: r=5'b10001; 3'd5: r=5'b10001; 3'd6: r=5'b11110; default: r=5'b00000;
+                    endcase
                 default: r = 5'b00000; // 17 = space, or anything unmapped
             endcase
             glyph_row = r;
@@ -3046,6 +3374,78 @@ localparam CAR_W = 10'd128;
         end
     endfunction
 
+    // ------------------------------------------------------------------
+    // Countdown / "GO!" glyph select: char 0 shows the current digit
+    // (3,2,1) while countdown_active is high; once it flips over to
+    // go_banner_timer instead, chars 0-1 show "GO". Both states share
+    // one small 2-character HUD box (see the countdown HUD block below).
+    // ------------------------------------------------------------------
+    function [4:0] countdown_char;
+        input [3:0] idx;
+        begin
+            if (countdown_active) begin
+                case (idx)
+                    4'd0: countdown_char = {3'b0, countdown_num}; // '3','2','1'
+                    default: countdown_char = 5'd17; // space
+                endcase
+            end else begin
+                case (idx)
+                    4'd0: countdown_char = 5'd10; // G
+                    4'd1: countdown_char = 5'd14; // O
+                    default: countdown_char = 5'd17;
+                endcase
+            end
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Zone badge glyph select: spells "AREA" + a digit (zone_id+1, so
+    // 1..4) -- see the "zone badge popup" HUD block further down.
+    // ------------------------------------------------------------------
+    function [4:0] badge_char;
+        input [3:0] idx;
+        begin
+            case (idx)
+                4'd0: badge_char = 5'd11; // A
+                4'd1: badge_char = 5'd16; // R
+                4'd2: badge_char = 5'd13; // E
+                4'd3: badge_char = 5'd11; // A
+                default: badge_char = {3'b0, zone_id} + 5'd1; // '1'..'4'
+            endcase
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Run-recap glyph select: first 4 cells spell "LAST" or "BEST"
+    // depending on is_best, remaining cells show a supplied BCD digit.
+    // ------------------------------------------------------------------
+    function [4:0] recap_char;
+        input        is_best; // 0 = "LAST", 1 = "BEST"
+        input [3:0]  idx;
+        input [3:0]  digit_val;
+        begin
+            if (idx < 4'd4) begin
+                if (is_best) begin
+                    case (idx)
+                        4'd0: recap_char = 5'd23; // B
+                        4'd1: recap_char = 5'd13; // E
+                        4'd2: recap_char = 5'd20; // S
+                        default: recap_char = 5'd21; // T
+                    endcase
+                end else begin
+                    case (idx)
+                        4'd0: recap_char = 5'd22; // L
+                        4'd1: recap_char = 5'd11; // A
+                        4'd2: recap_char = 5'd20; // S
+                        default: recap_char = 5'd21; // T
+                    endcase
+                end
+            end else begin
+                recap_char = {1'b0, digit_val};
+            end
+        end
+    endfunction
+
     // ---- Binary -> 5-digit BCD (double-dabble), so 16-bit score/
     // high-score registers can be split into individual decimal digits
     // to feed the font above. Pure combinational (loop is unrolled at
@@ -3073,6 +3473,21 @@ localparam CAR_W = 10'd128;
 
     wire [19:0] score_bcd      = bin_to_bcd(score);
     wire [19:0] high_score_bcd = bin_to_bcd(high_score);
+    wire [19:0] last_score_bcd = bin_to_bcd(last_run_score);
+    wire [19:0] dist_bcd       = bin_to_bcd(distance_traveled[15:0]); // odometer-style, wraps at 65535 -- a fun counter, not an exact total
+
+    // ------------------------------------------------------------------
+    // HUD shake sampling coordinates: x_hud/y_hud are x/y nudged by
+    // shake_offset_x/y (see the feedback-visual block above). Every HUD
+    // panel that should visibly "kick" on a crash (score/high-score/
+    // lives/distance) samples itself at x_hud/y_hud instead of the raw
+    // x/y; everything else in the file (road, car, obstacles, other HUD
+    // elements) is untouched.
+    // ------------------------------------------------------------------
+    wire signed [10:0] x_shaken_s = $signed({1'b0, x}) - {{8{shake_offset_x[2]}}, shake_offset_x};
+    wire signed [10:0] y_shaken_s = $signed({1'b0, y}) - {{8{shake_offset_y[2]}}, shake_offset_y};
+    wire [9:0] x_hud = (x_shaken_s < 11'sd0) ? 10'd0 : x_shaken_s[9:0];
+    wire [9:0] y_hud = (y_shaken_s < 11'sd0) ? 10'd0 : y_shaken_s[9:0];
 
     // ---- Score HUD position: top-left, 5 digits. Shrunk down (16px
     // cell / 2x glyph scale, was 32px cell / 4x scale) so the panel
@@ -3090,22 +3505,22 @@ localparam CAR_W = 10'd128;
     wire [9:0] score_box_w = SCORE_DIGITS * SCORE_CELL;
     wire [9:0] score_box_h = SCORE_CELL;
 
-    wire in_score_box = (x >= SCORE_X0) && (x < SCORE_X0 + score_box_w) &&
-                        (y >= SCORE_Y0) && (y < SCORE_Y0 + score_box_h);
+    wire in_score_box = (x_hud >= SCORE_X0) && (x_hud < SCORE_X0 + score_box_w) &&
+                        (y_hud >= SCORE_Y0) && (y_hud < SCORE_Y0 + score_box_h);
 
     // Panel: a dark backdrop a bit bigger than the digits themselves,
     // with a bright gold border ring around the edge.
-    wire in_score_panel = (x >= SCORE_X0 - SCORE_PANEL_MARGIN) && (x < SCORE_X0 + score_box_w + SCORE_PANEL_MARGIN) &&
-                          (y >= SCORE_Y0 - SCORE_PANEL_MARGIN) && (y < SCORE_Y0 + score_box_h + SCORE_PANEL_MARGIN);
+    wire in_score_panel = (x_hud >= SCORE_X0 - SCORE_PANEL_MARGIN) && (x_hud < SCORE_X0 + score_box_w + SCORE_PANEL_MARGIN) &&
+                          (y_hud >= SCORE_Y0 - SCORE_PANEL_MARGIN) && (y_hud < SCORE_Y0 + score_box_h + SCORE_PANEL_MARGIN);
 
     wire in_score_border = in_score_panel &&
-                           ((x < SCORE_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                            (x >= SCORE_X0 + score_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
-                            (y < SCORE_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                            (y >= SCORE_Y0 + score_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
+                           ((x_hud < SCORE_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (x_hud >= SCORE_X0 + score_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
+                            (y_hud < SCORE_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (y_hud >= SCORE_Y0 + score_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
 
-    wire [9:0] score_xrel = x - SCORE_X0;
-    wire [9:0] score_yrel = y - SCORE_Y0;
+    wire [9:0] score_xrel = x_hud - SCORE_X0;
+    wire [9:0] score_yrel = y_hud - SCORE_Y0;
     wire [3:0] score_digit_idx = score_xrel[9:4];          // /16
     wire [2:0] score_col       = score_xrel[3:0] >> 1;      // within-cell col, /2 (SCALE)
     wire [2:0] score_row       = score_yrel[3:0] >> 1;      // within-cell row, /2 (SCALE)
@@ -3134,20 +3549,20 @@ localparam CAR_W = 10'd128;
     wire [9:0] hi_box_w = (HI_LABEL_CHARS + HI_DIGITS) * HI_CELL;
     wire [9:0] hi_box_h = HI_CELL;
 
-    wire in_hi_box = (x >= HI_X0) && (x < HI_X0 + hi_box_w) &&
-                     (y >= HI_Y0) && (y < HI_Y0 + hi_box_h);
+    wire in_hi_box = (x_hud >= HI_X0) && (x_hud < HI_X0 + hi_box_w) &&
+                     (y_hud >= HI_Y0) && (y_hud < HI_Y0 + hi_box_h);
 
-    wire in_hi_panel = (x >= HI_X0 - SCORE_PANEL_MARGIN) && (x < HI_X0 + hi_box_w + SCORE_PANEL_MARGIN) &&
-                       (y >= HI_Y0 - SCORE_PANEL_MARGIN) && (y < HI_Y0 + hi_box_h + SCORE_PANEL_MARGIN);
+    wire in_hi_panel = (x_hud >= HI_X0 - SCORE_PANEL_MARGIN) && (x_hud < HI_X0 + hi_box_w + SCORE_PANEL_MARGIN) &&
+                       (y_hud >= HI_Y0 - SCORE_PANEL_MARGIN) && (y_hud < HI_Y0 + hi_box_h + SCORE_PANEL_MARGIN);
 
     wire in_hi_border = in_hi_panel &&
-                        ((x < HI_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                         (x >= HI_X0 + hi_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
-                         (y < HI_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                         (y >= HI_Y0 + hi_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
+                        ((x_hud < HI_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                         (x_hud >= HI_X0 + hi_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
+                         (y_hud < HI_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                         (y_hud >= HI_Y0 + hi_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
 
-    wire [9:0] hi_xrel = x - HI_X0;
-    wire [9:0] hi_yrel = y - HI_Y0;
+    wire [9:0] hi_xrel = x_hud - HI_X0;
+    wire [9:0] hi_yrel = y_hud - HI_Y0;
     wire [3:0] hi_cell_idx = hi_xrel[9:4];        // /16, which of the 7 cells (2 label + 5 digits)
     wire [2:0] hi_col      = hi_xrel[3:0] >> 1;
     wire [2:0] hi_row      = hi_yrel[3:0] >> 1;
@@ -3191,12 +3606,15 @@ localparam CAR_W = 10'd128;
 
     // ---- "START" banner: same 32x32-cell style as GAME OVER, just 5
     // characters instead of 9, shown only before the player has
-    // pressed start_btn for the first time.
+    // pressed start_btn for the first time (and only once the 3-2-1
+    // countdown that follows a press has been dismissed -- otherwise
+    // the countdown digit HUD below takes over this same on-screen
+    // spot).
     localparam ST_CHARS = 4'd5;
     localparam ST_X0 = (10'd640 - ST_CHARS * 10'd32) >> 1; // centered horizontally
     localparam ST_Y0 = GO_Y0;                                // same vertical spot GAME OVER uses
 
-    wire in_st_box = !game_started &&
+    wire in_st_box = !game_started && !countdown_active &&
                      (x >= ST_X0) && (x < ST_X0 + (ST_CHARS * 10'd32)) &&
                      (y >= ST_Y0) && (y < ST_Y0 + 10'd32);
 
@@ -3210,9 +3628,153 @@ localparam CAR_W = 10'd128;
     wire st_glyph_bit = in_st_box && (st_col < 3'd5) && (st_row < 3'd7) &&
                         st_glyph_row[4 - st_col];
 
-    wire in_st_panel = !game_started &&
+    wire in_st_panel = !game_started && !countdown_active &&
                        (x >= ST_X0 - SCORE_PANEL_MARGIN) && (x < ST_X0 + (ST_CHARS * 10'd32) + SCORE_PANEL_MARGIN) &&
                        (y >= ST_Y0 - SCORE_PANEL_MARGIN) && (y < ST_Y0 + 10'd32 + SCORE_PANEL_MARGIN);
+
+    // ---- Countdown / "GO!" HUD: sits in the exact same centered spot
+    // the START banner and GAME OVER text use, so there's only ever
+    // one big message on screen at a time. Visible for the duration of
+    // countdown_active (showing 3, 2, 1) and then for go_banner_timer
+    // right after (showing "GO", while gameplay has already begun).
+    localparam CD_CHARS = 4'd2;
+    localparam CD_X0 = (10'd640 - CD_CHARS * 10'd32) >> 1;
+    localparam CD_Y0 = GO_Y0;
+
+    wire cd_visible = countdown_active || (go_banner_timer != 6'd0);
+
+    wire in_cd_box = cd_visible &&
+                     (x >= CD_X0) && (x < CD_X0 + (CD_CHARS * 10'd32)) &&
+                     (y >= CD_Y0) && (y < CD_Y0 + 10'd32);
+
+    wire [9:0] cd_xrel = x - CD_X0;
+    wire [9:0] cd_yrel = y - CD_Y0;
+    wire [3:0] cd_char_idx = cd_xrel[9:5];
+    wire [2:0] cd_col      = cd_xrel[4:0] >> 2;
+    wire [2:0] cd_row      = cd_yrel[4:0] >> 2;
+
+    wire [4:0] cd_glyph_row = glyph_row(countdown_char(cd_char_idx), cd_row);
+    wire cd_glyph_bit = in_cd_box && (cd_col < 3'd5) && (cd_row < 3'd7) &&
+                        cd_glyph_row[4 - cd_col];
+
+    wire in_cd_panel = cd_visible &&
+                       (x >= CD_X0 - SCORE_PANEL_MARGIN) && (x < CD_X0 + (CD_CHARS * 10'd32) + SCORE_PANEL_MARGIN) &&
+                       (y >= CD_Y0 - SCORE_PANEL_MARGIN) && (y < CD_Y0 + 10'd32 + SCORE_PANEL_MARGIN);
+
+    // ---- Run recap (last score / best score): shown on the START
+    // screen once the player has completed at least one run, stacked
+    // underneath the START banner. Same shrunk 16px-cell HUD style as
+    // the score/hi-score panels. near_beat_highscore highlights the
+    // "last run" line in pulsing gold when the player came within 50
+    // points of their own best but didn't beat it -- the "hampir
+    // ngalahin diri sendiri" nudge to go again.
+    localparam RECAP_CHARS_LABEL = 4'd4; // "LAST" or "BEST"
+    localparam RECAP_DIGITS      = 4'd5;
+    localparam RECAP_CELL        = 10'd16;
+    localparam RECAP_X0 = (10'd640 - (RECAP_CHARS_LABEL + RECAP_DIGITS) * RECAP_CELL) >> 1;
+    localparam RECAP_Y0_LAST = ST_Y0 + 10'd32 + SCORE_PANEL_MARGIN * 2 + 10'd14;
+    localparam RECAP_Y0_BEST = RECAP_Y0_LAST + RECAP_CELL + SCORE_PANEL_MARGIN * 2 + 10'd6;
+
+    wire recap_visible = !game_started && !countdown_active && has_played_once;
+
+    wire near_beat_highscore = has_played_once && (last_run_score < high_score) &&
+                                ((high_score - last_run_score) <= 16'd50);
+
+    wire [9:0] recap_box_w = (RECAP_CHARS_LABEL + RECAP_DIGITS) * RECAP_CELL;
+
+    // -- LAST row --
+    wire in_recap_last_box = recap_visible &&
+                              (x >= RECAP_X0) && (x < RECAP_X0 + recap_box_w) &&
+                              (y >= RECAP_Y0_LAST) && (y < RECAP_Y0_LAST + RECAP_CELL);
+    wire in_recap_last_panel = recap_visible &&
+                              (x >= RECAP_X0 - SCORE_PANEL_MARGIN) && (x < RECAP_X0 + recap_box_w + SCORE_PANEL_MARGIN) &&
+                              (y >= RECAP_Y0_LAST - SCORE_PANEL_MARGIN) && (y < RECAP_Y0_LAST + RECAP_CELL + SCORE_PANEL_MARGIN);
+
+    wire [9:0] recap_last_xrel = x - RECAP_X0;
+    wire [9:0] recap_last_yrel = y - RECAP_Y0_LAST;
+    wire [3:0] recap_last_cell_idx = recap_last_xrel[9:4];
+    wire [2:0] recap_last_col      = recap_last_xrel[3:0] >> 1;
+    wire [2:0] recap_last_row      = recap_last_yrel[3:0] >> 1;
+    wire [3:0] recap_last_digit_idx = recap_last_cell_idx - RECAP_CHARS_LABEL;
+    wire [3:0] recap_last_digit_val = (recap_last_digit_idx == 4'd0) ? last_score_bcd[19:16] :
+                                       (recap_last_digit_idx == 4'd1) ? last_score_bcd[15:12] :
+                                       (recap_last_digit_idx == 4'd2) ? last_score_bcd[11:8]  :
+                                       (recap_last_digit_idx == 4'd3) ? last_score_bcd[7:4]   :
+                                                                          last_score_bcd[3:0];
+    wire [4:0] recap_last_chsel = recap_char(1'b0, recap_last_cell_idx, recap_last_digit_val);
+    wire [4:0] recap_last_glyph_row = glyph_row(recap_last_chsel, recap_last_row);
+    wire recap_last_glyph_bit = in_recap_last_box && (recap_last_col < 3'd5) && (recap_last_row < 3'd7) &&
+                                 recap_last_glyph_row[4 - recap_last_col];
+
+    // -- BEST row --
+    wire in_recap_best_box = recap_visible &&
+                              (x >= RECAP_X0) && (x < RECAP_X0 + recap_box_w) &&
+                              (y >= RECAP_Y0_BEST) && (y < RECAP_Y0_BEST + RECAP_CELL);
+    wire in_recap_best_panel = recap_visible &&
+                              (x >= RECAP_X0 - SCORE_PANEL_MARGIN) && (x < RECAP_X0 + recap_box_w + SCORE_PANEL_MARGIN) &&
+                              (y >= RECAP_Y0_BEST - SCORE_PANEL_MARGIN) && (y < RECAP_Y0_BEST + RECAP_CELL + SCORE_PANEL_MARGIN);
+
+    wire [9:0] recap_best_xrel = x - RECAP_X0;
+    wire [9:0] recap_best_yrel = y - RECAP_Y0_BEST;
+    wire [3:0] recap_best_cell_idx = recap_best_xrel[9:4];
+    wire [2:0] recap_best_col      = recap_best_xrel[3:0] >> 1;
+    wire [2:0] recap_best_row      = recap_best_yrel[3:0] >> 1;
+    wire [3:0] recap_best_digit_idx = recap_best_cell_idx - RECAP_CHARS_LABEL;
+    wire [3:0] recap_best_digit_val = (recap_best_digit_idx == 4'd0) ? high_score_bcd[19:16] :
+                                       (recap_best_digit_idx == 4'd1) ? high_score_bcd[15:12] :
+                                       (recap_best_digit_idx == 4'd2) ? high_score_bcd[11:8]  :
+                                       (recap_best_digit_idx == 4'd3) ? high_score_bcd[7:4]   :
+                                                                          high_score_bcd[3:0];
+    wire [4:0] recap_best_chsel = recap_char(1'b1, recap_best_cell_idx, recap_best_digit_val);
+    wire [4:0] recap_best_glyph_row = glyph_row(recap_best_chsel, recap_best_row);
+    wire recap_best_glyph_bit = in_recap_best_box && (recap_best_col < 3'd5) && (recap_best_row < 3'd7) &&
+                                 recap_best_glyph_row[4 - recap_best_col];
+
+    // ---- Zone badge popup: "AREA n" flashed centered near the top of
+    // the screen (just under the curve-direction HUD) whenever zone_id
+    // changes, so the automatic distance-based scenery swap (village/
+    // city/snow/night) reads as a noticed event.
+    localparam BADGE_CHARS = 4'd5;
+    localparam BADGE_CELL  = 10'd16;
+    localparam BADGE_X0 = (10'd640 - BADGE_CHARS * BADGE_CELL) >> 1;
+    localparam BADGE_Y0 = 10'd46; // just under the curve-direction HUD
+
+    wire zone_badge_visible = (zone_badge_timer != 7'd0);
+
+    wire [9:0] badge_box_w = BADGE_CHARS * BADGE_CELL;
+
+    wire in_badge_box = zone_badge_visible &&
+                        (x >= BADGE_X0) && (x < BADGE_X0 + badge_box_w) &&
+                        (y >= BADGE_Y0) && (y < BADGE_Y0 + BADGE_CELL);
+    wire in_badge_panel = zone_badge_visible &&
+                        (x >= BADGE_X0 - SCORE_PANEL_MARGIN) && (x < BADGE_X0 + badge_box_w + SCORE_PANEL_MARGIN) &&
+                        (y >= BADGE_Y0 - SCORE_PANEL_MARGIN) && (y < BADGE_Y0 + BADGE_CELL + SCORE_PANEL_MARGIN);
+
+    wire [9:0] badge_xrel = x - BADGE_X0;
+    wire [9:0] badge_yrel = y - BADGE_Y0;
+    wire [3:0] badge_cell_idx = badge_xrel[9:4];
+    wire [2:0] badge_col      = badge_xrel[3:0] >> 1;
+    wire [2:0] badge_row      = badge_yrel[3:0] >> 1;
+
+    wire [4:0] badge_glyph_row = glyph_row(badge_char(badge_cell_idx), badge_row);
+    wire badge_glyph_bit = in_badge_box && (badge_col < 3'd5) && (badge_row < 3'd7) &&
+                           badge_glyph_row[4 - badge_col];
+
+    // Per-zone accent color for the badge panel border, matching each
+    // district's own color family (village green, city grey, snow
+    // blue-white, night purple).
+    wire [7:0] badge_accent_r = (zone_id == 2'd0) ? 8'd120 : (zone_id == 2'd1) ? 8'd170 : (zone_id == 2'd2) ? 8'd220 : 8'd150;
+    wire [7:0] badge_accent_g = (zone_id == 2'd0) ? 8'd220 : (zone_id == 2'd1) ? 8'd170 : (zone_id == 2'd2) ? 8'd235 : 8'd110;
+    wire [7:0] badge_accent_b = (zone_id == 2'd0) ? 8'd140 : (zone_id == 2'd1) ? 8'd180 : (zone_id == 2'd2) ? 8'd250 : 8'd230;
+
+    // ---- Distance-traveled HUD: "DIST" + 5 digits, stacked below the
+    // lives panel (declared next). Shakes along with the other
+    // persistent panels via x_hud/y_hud.
+    localparam DIST_LABEL_CHARS = 4'd4; // "DIST"
+    localparam DIST_DIGITS      = 4'd5;
+    localparam DIST_CELL        = 10'd16;
+    localparam DIST_X0 = SCORE_X0;
+    // DIST_Y0 is defined further below, once LIVES_Y0/LIVES_CELL exist.
 
     // ---- Lives panel: same shrunk visual family as the score/
     // high-score panels above, showing a single digit (0-5 now that
@@ -3225,26 +3787,64 @@ localparam CAR_W = 10'd128;
     wire [9:0] lives_box_w = LIVES_CELL;
     wire [9:0] lives_box_h = LIVES_CELL;
 
-    wire in_lives_box = (x >= LIVES_X0) && (x < LIVES_X0 + lives_box_w) &&
-                        (y >= LIVES_Y0) && (y < LIVES_Y0 + lives_box_h);
+    wire in_lives_box = (x_hud >= LIVES_X0) && (x_hud < LIVES_X0 + lives_box_w) &&
+                        (y_hud >= LIVES_Y0) && (y_hud < LIVES_Y0 + lives_box_h);
 
-    wire in_lives_panel = (x >= LIVES_X0 - SCORE_PANEL_MARGIN) && (x < LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN) &&
-                          (y >= LIVES_Y0 - SCORE_PANEL_MARGIN) && (y < LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN);
+    wire in_lives_panel = (x_hud >= LIVES_X0 - SCORE_PANEL_MARGIN) && (x_hud < LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN) &&
+                          (y_hud >= LIVES_Y0 - SCORE_PANEL_MARGIN) && (y_hud < LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN);
 
     wire in_lives_border = in_lives_panel &&
-                           ((x < LIVES_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                            (x >= LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
-                            (y < LIVES_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
-                            (y >= LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
+                           ((x_hud < LIVES_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (x_hud >= LIVES_X0 + lives_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
+                            (y_hud < LIVES_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                            (y_hud >= LIVES_Y0 + lives_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
 
-    wire [9:0] lives_xrel = x - LIVES_X0;
-    wire [9:0] lives_yrel = y - LIVES_Y0;
+    wire [9:0] lives_xrel = x_hud - LIVES_X0;
+    wire [9:0] lives_yrel = y_hud - LIVES_Y0;
     wire [2:0] lives_col  = lives_xrel[3:0] >> 1;
     wire [2:0] lives_row  = lives_yrel[3:0] >> 1;
 
     wire [4:0] lives_glyph_row = glyph_row({2'd0, lives}, lives_row);
     wire lives_glyph_bit = in_lives_box && (lives_col < 3'd5) && (lives_row < 3'd7) &&
                            lives_glyph_row[4 - lives_col];
+
+    // -- Distance HUD position, now that LIVES_Y0/LIVES_CELL exist --
+    localparam DIST_Y0 = LIVES_Y0 + LIVES_CELL + SCORE_PANEL_MARGIN * 2 + 10'd6;
+
+    wire [9:0] dist_box_w = (DIST_LABEL_CHARS + DIST_DIGITS) * DIST_CELL;
+    wire [9:0] dist_box_h = DIST_CELL;
+
+    wire in_dist_box = (x_hud >= DIST_X0) && (x_hud < DIST_X0 + dist_box_w) &&
+                       (y_hud >= DIST_Y0) && (y_hud < DIST_Y0 + dist_box_h);
+
+    wire in_dist_panel = (x_hud >= DIST_X0 - SCORE_PANEL_MARGIN) && (x_hud < DIST_X0 + dist_box_w + SCORE_PANEL_MARGIN) &&
+                         (y_hud >= DIST_Y0 - SCORE_PANEL_MARGIN) && (y_hud < DIST_Y0 + dist_box_h + SCORE_PANEL_MARGIN);
+
+    wire in_dist_border = in_dist_panel &&
+                          ((x_hud < DIST_X0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                           (x_hud >= DIST_X0 + dist_box_w + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK) ||
+                           (y_hud < DIST_Y0 - SCORE_PANEL_MARGIN + SCORE_BORDER_THICK) ||
+                           (y_hud >= DIST_Y0 + dist_box_h + SCORE_PANEL_MARGIN - SCORE_BORDER_THICK));
+
+    wire [9:0] dist_xrel = x_hud - DIST_X0;
+    wire [9:0] dist_yrel = y_hud - DIST_Y0;
+    wire [3:0] dist_cell_idx = dist_xrel[9:4];
+    wire [2:0] dist_col      = dist_xrel[3:0] >> 1;
+    wire [2:0] dist_row      = dist_yrel[3:0] >> 1;
+    wire [3:0] dist_digit_idx = dist_cell_idx - DIST_LABEL_CHARS;
+    wire [3:0] dist_digit_val = (dist_digit_idx == 4'd0) ? dist_bcd[19:16] :
+                                 (dist_digit_idx == 4'd1) ? dist_bcd[15:12] :
+                                 (dist_digit_idx == 4'd2) ? dist_bcd[11:8]  :
+                                 (dist_digit_idx == 4'd3) ? dist_bcd[7:4]   :
+                                                              dist_bcd[3:0];
+    wire [4:0] dist_chsel = (dist_cell_idx == 4'd0) ? 5'd24 : // 'D'
+                            (dist_cell_idx == 4'd1) ? 5'd19 : // 'I'
+                            (dist_cell_idx == 4'd2) ? 5'd20 : // 'S'
+                            (dist_cell_idx == 4'd3) ? 5'd21 : // 'T'
+                                                        {1'b0, dist_digit_val};
+    wire [4:0] dist_glyph_row = glyph_row(dist_chsel, dist_row);
+    wire dist_glyph_bit = in_dist_box && (dist_col < 3'd5) && (dist_row < 3'd7) &&
+                          dist_glyph_row[4 - dist_col];
 
     // ------------------------------------------------------------------
     // Curve-direction HUD: a solid triangle/chevron pinned to the top
@@ -3574,6 +4174,51 @@ localparam CAR_W = 10'd128;
                 terrain_r = 8'd72;
                 terrain_g = 8'd54;
                 terrain_b = 8'd68;
+            end
+
+            else if (light_glow) begin
+                // Cahaya hangat kecil di bawah rumah lampu -- ukurannya
+                // tetap kecil, tidak ikut membesar seiring jarak.
+                terrain_r = 8'd230;
+                terrain_g = 8'd190;
+                terrain_b = 8'd90;
+            end
+
+            else if (light_lamp_housing) begin
+                // Rumah lampu di ujung lengan -- abu-abu gelap netral.
+                terrain_r = 8'd70;
+                terrain_g = 8'd70;
+                terrain_b = 8'd75;
+            end
+
+            else if (light_arm) begin
+                // Lengan tiang yang menekuk ke arah jalan.
+                terrain_r = 8'd60;
+                terrain_g = 8'd60;
+                terrain_b = 8'd65;
+            end
+
+            else if (light_panel) begin
+                // Panel surya kecil -- biru gelap keunguan, beda jelas
+                // dari abu-abu logam tiang/lengan/lampu.
+                terrain_r = 8'd30;
+                terrain_g = 8'd40;
+                terrain_b = 8'd75;
+            end
+
+            else if (light_pole_lit) begin
+                // Sisi terang tiang lampu -- abu-abu gelap netral,
+                // sengaja tidak seceria pohon/rumah karena ini logam.
+                terrain_r = 8'd90;
+                terrain_g = 8'd90;
+                terrain_b = 8'd95;
+            end
+
+            else if (light_pole_shadow) begin
+                // Sisi bayangan tiang lampu.
+                terrain_r = 8'd55;
+                terrain_g = 8'd55;
+                terrain_b = 8'd60;
             end
 
             else if (pond_shore) begin
@@ -4064,6 +4709,23 @@ localparam CAR_W = 10'd128;
                 blue  = 8'd100;   // red-ish "lives" digit
             end
 
+            if (in_dist_panel) begin
+                if (in_dist_border) begin
+                    red   = 8'd160;
+                    green = 8'd200;
+                    blue  = 8'd255;   // pale blue border for the distance panel
+                end else begin
+                    red   = 8'd18;
+                    green = 8'd16;
+                    blue  = 8'd30;
+                end
+            end
+            if (dist_glyph_bit) begin
+                red   = 8'd180;
+                green = 8'd215;
+                blue  = 8'd255;   // pale blue "distance" digits
+            end
+
             if (in_curve_hud_panel) begin
                 if (in_curve_hud_border) begin
                     red   = 8'd255;
@@ -4081,6 +4743,17 @@ localparam CAR_W = 10'd128;
                 blue  = 8'd60;    // bright yellow chevron
             end
 
+            if (in_badge_panel) begin
+                red   = badge_accent_r;
+                green = badge_accent_g;
+                blue  = badge_accent_b;
+            end
+            if (badge_glyph_bit) begin
+                red   = 8'd255;
+                green = 8'd255;
+                blue  = 8'd240;   // bright near-white badge text, pops against any accent color
+            end
+
             if (in_st_panel) begin
                 red   = 8'd18;
                 green = 8'd16;
@@ -4090,6 +4763,46 @@ localparam CAR_W = 10'd128;
                 red   = 8'd120;
                 green = 8'd255;
                 blue  = 8'd140;   // green "START" text -- distinct from the red GAME OVER
+            end
+
+            if (in_recap_last_panel) begin
+                red   = 8'd18;
+                green = 8'd16;
+                blue  = 8'd30;
+            end
+            if (recap_last_glyph_bit) begin
+                if (near_beat_highscore) begin
+                    // Pulsing gold: "hampir ngalahin diri sendiri" nudge.
+                    red   = 8'd255;
+                    green = 8'd210 + {3'b0, shimmer_phase[4:2]};
+                    blue  = 8'd60;
+                end else begin
+                    red   = 8'd255;
+                    green = 8'd150;
+                    blue  = 8'd150;   // soft red "last run" digits
+                end
+            end
+
+            if (in_recap_best_panel) begin
+                red   = 8'd18;
+                green = 8'd16;
+                blue  = 8'd30;
+            end
+            if (recap_best_glyph_bit) begin
+                red   = 8'd255;
+                green = 8'd215;
+                blue  = 8'd90;    // gold "best" digits
+            end
+
+            if (in_cd_panel) begin
+                red   = 8'd18;
+                green = 8'd16;
+                blue  = 8'd30;
+            end
+            if (cd_glyph_bit) begin
+                red   = 8'd255;
+                green = 8'd230;
+                blue  = 8'd60;    // bright yellow countdown / "GO!" text
             end
 
             if (go_glyph_bit) begin
