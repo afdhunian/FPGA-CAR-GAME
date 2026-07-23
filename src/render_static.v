@@ -517,6 +517,11 @@ module render_static (
 
     assign asphalt_fleck = x[1] ^ x[4] ^ anim_y[2] ^ anim_y[5];
 
+    // Pola kilau tipis untuk pantulan lampu jalan di aspal basah. Ikut
+    // anim_y, jadi pantulannya terlihat ikut menggeser mendekati kamera
+    // bersama aspalnya -- bukan pola yang diam di layar.
+    wire wet_glint = anim_y[1] ^ x[0];
+
     // Fine per-pixel color variation for the grass -- same cheap
     // XOR-speckle idiom as asphalt_fleck, just two independent bit
     // combos so there are 4 close, subtle shades instead of one flat
@@ -525,6 +530,141 @@ module render_static (
     wire grass_speck_a, grass_speck_b;
     assign grass_speck_a = x[0] ^ anim_y[0];
     assign grass_speck_b = x[2] ^ anim_y[2];
+
+    // ==================================================================
+    // ============ Fase animasi cuaca & langit (fitur baru) ============
+    // snow_scroll : fase turun butiran salju (jauh lebih lambat dari hujan)
+    // sky_scroll  : geser horizontal burung & awan -- SENGAJA tidak terikat
+    //               world_scroll_speed, jadi langit tetap hidup walaupun
+    //               mobil berhenti / game over / masih di layar START.
+    // Nilainya di-update sekali per frame di blok "feedback visual" jauh
+    // di bawah; dideklarasikan di sini supaya semua wire yang memakainya
+    // boleh muncul lebih awal tanpa forward reference.
+    //
+    // sky_scroll dibungkus di 2560 (= 640*4) supaya sky_scroll >> 2 (yang
+    // dipakai awan) juga membungkus tepat di 640 -- tidak ada lompatan
+    // posisi saat counter-nya wrap.
+    // ==================================================================
+    reg [9:0]  snow_scroll;
+    reg [11:0] sky_scroll;
+    initial snow_scroll = 10'd0;
+    initial sky_scroll  = 12'd0;
+
+    // ------------------------------------------------------------------
+    // Pembungkus koordinat X (mod 640) tanpa divider -- 640 bukan pangkat
+    // 2, jadi "%" akan disintesis jadi pembagi penuh. Nilai masuk paling
+    // besar 639 + 2559 = 3198, jadi maksimal 5 pengurangan sudah cukup,
+    // dan tiap pengurangan cuma komparator + subtractor (idiom yang sama
+    // dengan wrap_ty di bawah).
+    // ------------------------------------------------------------------
+    function [9:0] wrap_x;
+        input [12:0] v0;
+        reg [12:0] v;
+        begin
+            v = v0;
+            if (v >= 13'd640) v = v - 13'd640;
+            if (v >= 13'd640) v = v - 13'd640;
+            if (v >= 13'd640) v = v - 13'd640;
+            if (v >= 13'd640) v = v - 13'd640;
+            if (v >= 13'd640) v = v - 13'd640;
+            wrap_x = v[9:0];
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Burung: siluet "v" tipis 2 px. Sayap dihitung dari |dx| saja
+    // (target_y = by - (|dx| >> k)) -- tanpa perkalian sama sekali.
+    // `flap` mengganti kemiringan sayap (>>1 vs >>2) sehingga terlihat
+    // mengepak; fase kepakannya diambil dari bit sky_scroll, jadi gratis.
+    // ------------------------------------------------------------------
+    function bird_at;
+        input [9:0] px, py;
+        input [9:0] bx, by;
+        input [4:0] s;      // setengah rentang sayap
+        input       flap;
+        reg [10:0] adx, wing, ytar;
+        begin
+            adx  = (px >= bx) ? ({1'b0, px} - {1'b0, bx}) : ({1'b0, bx} - {1'b0, px});
+            wing = flap ? (adx >> 1) : (adx >> 2);
+            ytar = ({1'b0, by} > wing) ? ({1'b0, by} - wing) : 11'd0;
+            bird_at = (adx <= {6'd0, s}) &&
+                      (({1'b0, py} == ytar) || ({1'b0, py} == (ytar + 11'd1)));
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Awan: gabungan 3 elips pipih (dx^2 + (2*dy)^2 <= r^2) -- trik elips
+    // cepat yang sama dipakai pond_at, cuma diulang 3x dengan pusat &
+    // radius berbeda supaya siluetnya bergumpal, bukan bulat telur.
+    // Semua perkalian sengaja dilebarkan dulu: fungsi ini jalan untuk
+    // SETIAP piksel layar, jadi |dx| bisa sampai ~670 dan perkalian
+    // 13-bit self-determined akan diam-diam wrap (bug kelas yang sama
+    // dengan glitch bintang bonus dulu).
+    // ------------------------------------------------------------------
+    function cloud_at;
+        input [9:0] px, py;
+        input [9:0] cx, cy;
+        input [5:0] r;
+        reg signed [12:0] rx, ry, e0, e1, e2;
+        reg        [12:0] a0, a1, a2, ay;
+        reg        [25:0] q0, q1, q2, sq, rr0, rr1, rr2;
+        begin
+            rx = $signed({3'b0, px}) - $signed({3'b0, cx});
+            ry = $signed({3'b0, py}) - $signed({3'b0, cy});
+            ay = ry[12] ? (-ry) : ry;
+            sq = ({13'd0, ay} * {13'd0, ay}) <<< 2;   // (2*dy)^2 -> awan pipih
+
+            e0 = rx + $signed({7'd0, r});
+            e1 = rx;
+            e2 = rx - $signed({7'd0, r});
+            a0 = e0[12] ? (-e0) : e0;
+            a1 = e1[12] ? (-e1) : e1;
+            a2 = e2[12] ? (-e2) : e2;
+
+            q0 = {13'd0, a0} * {13'd0, a0};
+            q1 = {13'd0, a1} * {13'd0, a1};
+            q2 = {13'd0, a2} * {13'd0, a2};
+
+            rr1 = {20'd0, r} * {20'd0, r};
+            rr0 = {20'd0, (r - (r >> 2))} * {20'd0, (r - (r >> 2))};   // gumpalan kiri ~0.75r
+            rr2 = {20'd0, (r >> 1)}       * {20'd0, (r >> 1)};         // gumpalan kanan ~0.5r
+
+            cloud_at = ((q0 + sq) <= rr0) || ((q1 + sq) <= rr1) || ((q2 + sq) <= rr2);
+        end
+    endfunction
+
+    // ---- Instance burung: 3 ekor, tinggi & ukuran beda, fase kepak beda.
+    localparam [9:0] BIRD1_X0 = 10'd40,  BIRD1_Y = 10'd34;
+    localparam [9:0] BIRD2_X0 = 10'd230, BIRD2_Y = 10'd52;
+    localparam [9:0] BIRD3_X0 = 10'd430, BIRD3_Y = 10'd26;
+
+    wire [9:0] bird1_x = wrap_x({3'd0, BIRD1_X0} + {1'b0, sky_scroll});
+    wire [9:0] bird2_x = wrap_x({3'd0, BIRD2_X0} + {1'b0, sky_scroll});
+    wire [9:0] bird3_x = wrap_x({3'd0, BIRD3_X0} + {1'b0, sky_scroll});
+
+    wire bird_flap = sky_scroll[4];
+
+    wire bird_pixel = (y < 10'd118) &&
+                      (bird_at(x, y, bird1_x, BIRD1_Y, 5'd7,  bird_flap) ||
+                       bird_at(x, y, bird2_x, BIRD2_Y, 5'd5, ~bird_flap) ||
+                       bird_at(x, y, bird3_x, BIRD3_Y, 5'd6,  bird_flap));
+
+    // ---- Instance awan: bergerak 4x lebih lambat dari burung (parallax
+    // sederhana -- yang jauh bergerak lebih pelan).
+    localparam [9:0] CLOUD1_X0 = 10'd110, CLOUD1_Y = 10'd30;
+    localparam [9:0] CLOUD2_X0 = 10'd350, CLOUD2_Y = 10'd18;
+    localparam [9:0] CLOUD3_X0 = 10'd540, CLOUD3_Y = 10'd44;
+
+    wire [9:0] cloud_shift = sky_scroll[11:2];   // wrap tepat di 640
+
+    wire [9:0] cloud1_x = wrap_x({3'd0, CLOUD1_X0} + {3'd0, cloud_shift});
+    wire [9:0] cloud2_x = wrap_x({3'd0, CLOUD2_X0} + {3'd0, cloud_shift});
+    wire [9:0] cloud3_x = wrap_x({3'd0, CLOUD3_X0} + {3'd0, cloud_shift});
+
+    wire cloud_pixel = (y < 10'd95) &&
+                       (cloud_at(x, y, cloud1_x, CLOUD1_Y, 6'd26) ||
+                        cloud_at(x, y, cloud2_x, CLOUD2_Y, 6'd20) ||
+                        cloud_at(x, y, cloud3_x, CLOUD3_Y, 6'd30));
 
     // Grass decorations (flowers, small rocks, tall-grass clumps) have
     // all been removed -- replaced by more houses along the roadside
@@ -893,6 +1033,9 @@ module render_static (
 
     wire [2:0] lp_left  [0:NUM_LIGHTS_SIDE-1];
     wire [2:0] lp_right [0:NUM_LIGHTS_SIDE-1];
+    // Refleksi kepala lampu di aspal basah -- hanya hidup saat rain_active.
+    wire       rfl_left  [0:NUM_LIGHTS_SIDE-1];
+    wire       rfl_right [0:NUM_LIGHTS_SIDE-1];
 
     generate
         for (gi = 0; gi < NUM_LIGHTS_SIDE; gi = gi + 1) begin : gen_left_light
@@ -922,9 +1065,22 @@ module render_static (
 
             wire [9:0] this_lx = this_center - this_rhalf - LIGHT_GAP - this_pw;
 
+            // ---- Refleksi di aspal basah ----
+            // streetlight_at memakai arm_len = ph >> 2, jadi posisi kepala
+            // lampu dihitung ulang dengan rumus yang sama di sini. Strip
+            // pantulannya dipotong otomatis oleh road_area, jadi cuma bagian
+            // yang benar-benar jatuh di aspal yang menyala.
+            wire [9:0] this_lampx = this_lx + (this_ph >> 2);
+            wire [9:0] this_rw    = (this_pw << 1) + 10'd3;
+
             // Sisi kiri jalan -> lengan/lampu menjorok ke kanan (ke arah jalan).
             assign lp_left[gi] = streetlight_at(x, y, this_lx, this_ly,
                                                  this_pw[4:0], this_ph[5:0], 1'b1);
+
+            assign rfl_left[gi] = rain_active && road_area &&
+                                   (y >= this_ly) && (y < this_ly + this_ph) &&
+                                   ((x + this_rw) >= this_lampx) &&
+                                   (x <= this_lampx + this_rw);
         end
 
         for (gi = 0; gi < NUM_LIGHTS_SIDE; gi = gi + 1) begin : gen_right_light
@@ -943,13 +1099,24 @@ module render_static (
 
             wire [9:0] this_lx = this_center + this_rhalf + LIGHT_GAP + this_pw;
 
+            // ---- Refleksi di aspal basah (cermin dari sisi kiri) ----
+            wire [9:0] this_armlen = this_ph >> 2;
+            wire [9:0] this_lampx  = (this_lx > this_armlen) ? (this_lx - this_armlen) : 10'd0;
+            wire [9:0] this_rw     = (this_pw << 1) + 10'd3;
+
             // Sisi kanan jalan -> lengan/lampu menjorok ke kiri (ke arah jalan).
             assign lp_right[gi] = streetlight_at(x, y, this_lx, this_ly,
                                                   this_pw[4:0], this_ph[5:0], 1'b0);
+
+            assign rfl_right[gi] = rain_active && road_area &&
+                                    (y >= this_ly) && (y < this_ly + this_ph) &&
+                                    ((x + this_rw) >= this_lampx) &&
+                                    (x <= this_lampx + this_rw);
         end
     endgenerate
 
     reg light_pole_lit, light_pole_shadow, light_arm, light_lamp_housing, light_glow, light_panel;
+    reg light_reflection;
     integer li;
     always @(*) begin
         light_pole_lit      = 1'b0;
@@ -958,6 +1125,7 @@ module render_static (
         light_lamp_housing  = 1'b0;
         light_glow          = 1'b0;
         light_panel         = 1'b0;
+        light_reflection    = 1'b0;
         for (li = 0; li < NUM_LIGHTS_SIDE; li = li + 1) begin
             if (lp_left[li] == 3'b001 || lp_right[li] == 3'b001) light_pole_lit     = 1'b1;
             if (lp_left[li] == 3'b010 || lp_right[li] == 3'b010) light_pole_shadow  = 1'b1;
@@ -965,6 +1133,7 @@ module render_static (
             if (lp_left[li] == 3'b100 || lp_right[li] == 3'b100) light_lamp_housing = 1'b1;
             if (lp_left[li] == 3'b101 || lp_right[li] == 3'b101) light_glow         = 1'b1;
             if (lp_left[li] == 3'b110 || lp_right[li] == 3'b110) light_panel        = 1'b1;
+            if (rfl_left[li] || rfl_right[li])                   light_reflection   = 1'b1;
         end
     end
 
@@ -2254,17 +2423,24 @@ localparam CAR_W = 10'd128;
     // ------------------------------------------------------------------
     localparam [15:0] RIVAL_SPAWN_INTERVAL = 16'd300; // jeda antar kemunculan traffic (~5s)
     localparam [15:0] POINTS_PER_OVERTAKE  = 16'd15;  // bonus berhasil menyalip
+    localparam [15:0] POINTS_PER_VIP       = 16'd120; // bonus besar: menyalip mobil VIP langka
 
     reg        rival_active;
     reg [9:0]  rival_y;
     reg [1:0]  rival_lane;
     reg        rival_overlap_prev;
     reg [15:0] rival_spawn_timer;
+    // Random event kecil: sesekali traffic yang muncul adalah mobil "VIP"
+    // langka -- warnanya emas berkilau, dan kalau berhasil disalip memberi
+    // bonus poin jauh lebih besar + confetti. Tipenya di-roll sekali saat
+    // spawn, jadi satu mobil tidak pernah berubah tipe di tengah jalan.
+    reg        rival_is_vip;
     initial rival_active       = 1'b0;
     initial rival_y            = OBS_Y_START;
     initial rival_lane         = 2'd0;
     initial rival_overlap_prev = 1'b0;
     initial rival_spawn_timer  = RIVAL_SPAWN_INTERVAL;
+    initial rival_is_vip       = 1'b0;
 
     // Mendekat dengan separuh laju dunia (+1 supaya tidak pernah 0):
     // relatif terhadap aspal ia tetap melaju maju, pemain menyusulnya.
@@ -2719,6 +2895,12 @@ localparam CAR_W = 10'd128;
                                   ? ((rival_lane_pick0 == 2'd2) ? 2'd0 : (rival_lane_pick0 + 2'd1))
                                   : rival_lane_pick0;
 
+    // Apakah traffic BERIKUTNYA adalah mobil VIP langka? Diambil dari 3
+    // bit atas LFSR (peluang 1/8) -- bit-bit yang belum dipakai pemilih
+    // lajur maupun pemilih tipe kendaraan, jadi tidak berkorelasi dengan
+    // keduanya.
+    wire next_is_vip = (obstacle_rand[7:5] == 3'd5);
+
     // ---------------- Near-miss: kotak obstacle diperlebar ------------
     wire obstacle_near_overlap = obstacle_active &&
                                  (obs_left_s   - $signed({1'b0, NEAR_MARGIN_W}) < car_right_s)  &&
@@ -2786,6 +2968,19 @@ localparam CAR_W = 10'd128;
     wire [9:0] rain_xx = x + (y >> 3);
     wire [4:0] rain_col_hash = rain_xx[4:0] ^ {rain_xx[7:6], rain_xx[8], 2'b00};
     wire rain_streak = rain_active && (rain_col_hash[4:1] == 4'd0) && (rain_yy[4:0] < 5'd18);
+
+    // ---------------- Salju: butiran kecil jatuh pelan ----------------
+    // Idiom persis sama dengan hujan di atas, tapi dibedakan supaya nggak
+    // terbaca sebagai "hujan warna putih":
+    //   * fase turun sendiri (snow_scroll, ~3x lebih lambat dari hujan)
+    //   * miring ke arah BERLAWANAN (x - (yy>>4) vs x + (y>>3))
+    //   * panjang guratan cuma 2 px -> terbaca butiran, bukan garis air
+    //   * hash ikut menyertakan blok baris (snow_yy[7:6]) supaya butirannya
+    //     tersebar acak, tidak membentuk kolom lurus dari atas ke bawah
+    wire [9:0] snow_yy = y - snow_scroll;
+    wire [9:0] snow_xx = x - (snow_yy >> 4);
+    wire [4:0] snow_col_hash = snow_xx[4:0] ^ {snow_xx[7:6], snow_xx[8], 2'b00} ^ {3'b0, snow_yy[7:6]};
+    wire snow_flake = in_snow_zone && (snow_col_hash[4:1] == 4'd1) && (snow_yy[3:0] < 4'd2);
 
     // ---------------- Debu belok tajam --------------------------------
     // Bintik cokelat-abu kecil di sisi belakang-bawah mobil yang
@@ -2884,6 +3079,7 @@ localparam CAR_W = 10'd128;
             rival_lane             <= 2'd0;
             rival_overlap_prev     <= 1'b0;
             rival_spawn_timer      <= RIVAL_SPAWN_INTERVAL;
+            rival_is_vip           <= 1'b0;
             near_miss_latch        <= 1'b0;
         end else if (x == 10'd0 && y == 10'd0 && game_started) begin   // sekali per frame, tapi cuma setelah start ditekan
             // 8-bit maximal-length Fibonacci LFSR (taps 8,6,5,4).
@@ -3027,7 +3223,11 @@ localparam CAR_W = 10'd128;
                     end else if (rival_reached_end) begin
                         // Berhasil DISALIP: bonus poin menyalip + streak
                         // combo ikut memanjang -- rasa "balapan sungguhan".
-                        score        <= score + POINTS_PER_OVERTAKE + combo_bonus;
+                        // Mobil VIP membayar jauh lebih besar, itulah kenapa
+                        // ia layak dikejar walau harus ambil jalur berisiko.
+                        score        <= score
+                                        + (rival_is_vip ? POINTS_PER_VIP : POINTS_PER_OVERTAKE)
+                                        + combo_bonus;
                         combo_count  <= combo_count + 8'd1;
                         rival_active      <= 1'b0;
                         rival_spawn_timer <= RIVAL_SPAWN_INTERVAL;
@@ -3039,6 +3239,7 @@ localparam CAR_W = 10'd128;
                         rival_active       <= 1'b1;
                         rival_y            <= OBS_Y_START;
                         rival_lane         <= rival_lane_pick;
+                        rival_is_vip       <= next_is_vip;   // roll sekali, di sini saja
                         rival_overlap_prev <= 1'b0;
                     end else begin
                         rival_spawn_timer <= rival_spawn_timer - 16'd1;
@@ -3090,9 +3291,11 @@ localparam CAR_W = 10'd128;
     // MEWARNAI (di blok mux warna), tidak menyentuh state permainan --
     // sengaja dipisah dari blok skor/rintangan supaya mudah di-tune.
     //  * hit_flash        : layar berkilat merah sesaat setelah menabrak
-    //  * nm_flash         : kilatan emas singkat saat dodge "mepet"
+    //  * nm_flash         : kilatan emas singkat saat dodge "mepet" / VIP disalip
     //  * celebrate_timer  : hujan confetti tiap skor lewat kelipatan 1000
     //  * rain_scroll      : fase jatuh garis-garis hujan
+    //  * snow_scroll      : fase jatuh butiran salju
+    //  * sky_scroll       : geser horizontal burung & awan
     //  * lightning_flash  : kilatan petir putih-kebiruan sesaat saat hujan
     //  * shake_offset_x/y : goyangan singkat pada panel HUD sesaat tabrakan
     // ------------------------------------------------------------------
@@ -3103,6 +3306,7 @@ localparam CAR_W = 10'd128;
             celebrate_timer    <= 5'd0;
             milestone_target   <= MILESTONE_STEP;
             rain_scroll        <= 10'd0;
+            snow_scroll        <= 10'd0;
             lightning_flash    <= 4'd0;
             lightning_cooldown <= 10'd90;
             shake_timer        <= 4'd0;
@@ -3135,17 +3339,26 @@ localparam CAR_W = 10'd128;
                 shake_offset_y <= 3'sd0;
             end
 
-            // Kilatan emas: hanya saat obstacle sukses dilewati DAN
-            // tercatat near-miss (bukan saat menabrak).
+            // Kilatan emas: saat obstacle sukses dilewati DAN tercatat
+            // near-miss, ATAU saat mobil VIP langka berhasil disalip
+            // (yang terakhir sengaja lebih kuat -- hadiahnya lebih besar).
             if (game_started && !game_over && obstacle_reached_end &&
                 near_miss_latch && !collision_edge)
                 nm_flash <= 4'd8;
+            else if (game_started && !game_over && rival_reached_end &&
+                     rival_is_vip && !rival_collision_edge)
+                nm_flash <= 4'd12;
             else if (nm_flash != 4'd0)
                 nm_flash <= nm_flash - 4'd1;
 
-            // Milestone skor: sekali skor menembus target, rayakan lalu
-            // geser target ke kelipatan berikutnya.
-            if (score >= milestone_target) begin
+            // Menyalip VIP diperiksa DULUAN supaya perayaannya tidak
+            // "ketelan" pengecekan milestone di frame yang sama. Kalau
+            // kebetulan skornya juga menembus milestone di frame itu,
+            // pengecekan milestone tetap akan menyala di frame berikutnya.
+            if (game_started && !game_over && rival_reached_end &&
+                rival_is_vip && !rival_collision_edge) begin
+                celebrate_timer <= 5'd28;
+            end else if (score >= milestone_target) begin
                 celebrate_timer  <= 5'd28;
                 milestone_target <= milestone_target + MILESTONE_STEP;
             end else if (celebrate_timer != 5'd0) begin
@@ -3155,6 +3368,16 @@ localparam CAR_W = 10'd128;
             // Garis hujan jatuh ~10 px per frame (hanya efek visual,
             // jalan terus meski hujan sedang tidak aktif -- murah).
             rain_scroll <= rain_scroll + 10'd10;
+
+            // Salju turun jauh lebih pelan daripada hujan -- itu yang
+            // bikin dua cuaca ini langsung terbedakan walau sama-sama
+            // "partikel jatuh".
+            snow_scroll <= snow_scroll + 10'd3;
+
+            // Langit terus bergeser, TIDAK digating game_started/game_over,
+            // jadi burung & awan tetap jalan di layar START dan di layar
+            // GAME OVER -- scene-nya nggak pernah benar-benar beku.
+            sky_scroll  <= (sky_scroll >= 12'd2559) ? 12'd0 : (sky_scroll + 12'd1);
 
             // Petir: sekali cooldown habis DAN hujan sedang aktif, tiap
             // frame punya peluang kecil (1/8, dari 3 bit obstacle_rand
@@ -3337,6 +3560,29 @@ localparam CAR_W = 10'd128;
                 default: r = 5'b00000; // 17 = space, or anything unmapped
             endcase
             glyph_row = r;
+        end
+    endfunction
+
+    // ------------------------------------------------------------------
+    // Ikon hati 7x6 piksel untuk panel nyawa -- menggantikan digit angka.
+    // Bentuknya di-hardcode sebagai bitmap kecil (idiom yang sama dengan
+    // glyph_row di atas), jadi tidak butuh geometri lingkaran/segitiga
+    // apa pun: satu case, nol perkalian.
+    // ------------------------------------------------------------------
+    function [6:0] heart_row_bits;
+        input [2:0] row;
+        reg [6:0] r;
+        begin
+            case (row)
+                3'd0: r = 7'b0110110;
+                3'd1: r = 7'b1111111;
+                3'd2: r = 7'b1111111;
+                3'd3: r = 7'b0111110;
+                3'd4: r = 7'b0011100;
+                3'd5: r = 7'b0001000;
+                default: r = 7'b0000000;
+            endcase
+            heart_row_bits = r;
         end
     endfunction
 
@@ -3777,14 +4023,17 @@ localparam CAR_W = 10'd128;
     // DIST_Y0 is defined further below, once LIVES_Y0/LIVES_CELL exist.
 
     // ---- Lives panel: same shrunk visual family as the score/
-    // high-score panels above, showing a single digit (0-5 now that
-    // bonus lives can push past the original 3). Sits just below high
-    // score.
+    // high-score panels above. Sekarang menampilkan IKON HATI, bukan
+    // digit angka: selalu 5 slot (= LIVES_MAX), yang terisi merah
+    // menyala dan sisanya merah gelap, jadi pemain langsung tahu
+    // kapasitas maksimalnya -- itu yang bikin bintang +1 nyawa terasa
+    // berarti. Sits just below high score.
     localparam LIVES_X0 = SCORE_X0;
     localparam LIVES_Y0 = HI_Y0 + HI_CELL + SCORE_PANEL_MARGIN * 2 + 10'd6; // stacked below the HI panel
     localparam LIVES_CELL = 10'd16;
+    localparam LIVES_SLOTS = 5;   // = LIVES_MAX
 
-    wire [9:0] lives_box_w = LIVES_CELL;
+    wire [9:0] lives_box_w = LIVES_SLOTS * LIVES_CELL;
     wire [9:0] lives_box_h = LIVES_CELL;
 
     wire in_lives_box = (x_hud >= LIVES_X0) && (x_hud < LIVES_X0 + lives_box_w) &&
@@ -3801,12 +4050,17 @@ localparam CAR_W = 10'd128;
 
     wire [9:0] lives_xrel = x_hud - LIVES_X0;
     wire [9:0] lives_yrel = y_hud - LIVES_Y0;
-    wire [2:0] lives_col  = lives_xrel[3:0] >> 1;
-    wire [2:0] lives_row  = lives_yrel[3:0] >> 1;
+    wire [3:0] lives_cell_idx = lives_xrel[9:4];       // /16 -> hati ke-0..4
+    wire [2:0] lives_col      = lives_xrel[3:0] >> 1;  // kolom dalam sel, /2 (SCALE)
+    wire [2:0] lives_row      = lives_yrel[3:0] >> 1;  // baris dalam sel, /2 (SCALE)
 
-    wire [4:0] lives_glyph_row = glyph_row({2'd0, lives}, lives_row);
-    wire lives_glyph_bit = in_lives_box && (lives_col < 3'd5) && (lives_row < 3'd7) &&
-                           lives_glyph_row[4 - lives_col];
+    // Hati 7x6 diskalakan 2x (14x12 px), digeser 1 baris supaya kira-kira
+    // rata tengah di dalam sel 16x16 -- semua pembagian tetap bit-slice.
+    wire [6:0] lives_heart_row = heart_row_bits(lives_row - 3'd1);
+    wire lives_heart_bit = in_lives_box && (lives_col < 3'd7) &&
+                           (lives_row >= 3'd1) && (lives_row < 3'd7) &&
+                           lives_heart_row[6 - lives_col];
+    wire lives_heart_filled = (lives_cell_idx < {1'b0, lives});
 
     // -- Distance HUD position, now that LIVES_Y0/LIVES_CELL exist --
     localparam DIST_Y0 = LIVES_Y0 + LIVES_CELL + SCORE_PANEL_MARGIN * 2 + 10'd6;
@@ -3993,29 +4247,59 @@ localparam CAR_W = 10'd128;
         end
 
         else if (is_rival_area) begin
-            // Mobil traffic/rival: bodi BIRU supaya sekilas langsung
-            // terbedakan dari rintangan merah -- ini kendaraan yang
-            // berjalan searah dan bisa disalip.
-            if (riv_window) begin
-                red   = 8'd30;
-                green = 8'd38;
-                blue  = 8'd55;
-            end else if (riv_taillight) begin
-                red   = 8'd250;
-                green = 8'd50;
-                blue  = 8'd40;
-            end else if (riv_plate) begin
-                red   = 8'd225;
-                green = 8'd215;
-                blue  = 8'd175;
-            end else if (riv_roof) begin
-                red   = 8'd40;
-                green = 8'd80;
-                blue  = 8'd160;
+            if (rival_is_vip) begin
+                // ---- Mobil VIP langka: bodi EMAS yang berkilau halus
+                // (dimodulasi shimmer_phase yang sudah jalan untuk kolam),
+                // atap emas tua, kaca nyaris hitam kecoklatan, plat putih
+                // terang. Palet yang sengaja tidak dipakai objek lain mana
+                // pun, jadi begitu muncul di kejauhan langsung kelihatan
+                // "ini beda, kejar!".
+                if (riv_window) begin
+                    red   = 8'd45;
+                    green = 8'd35;
+                    blue  = 8'd20;
+                end else if (riv_taillight) begin
+                    red   = 8'd255;
+                    green = 8'd120;
+                    blue  = 8'd40;
+                end else if (riv_plate) begin
+                    red   = 8'd255;
+                    green = 8'd255;
+                    blue  = 8'd235;
+                end else if (riv_roof) begin
+                    red   = 8'd205;
+                    green = 8'd150;
+                    blue  = 8'd35;
+                end else begin
+                    red   = 8'd255;
+                    green = 8'd190 + {4'd0, shimmer_phase[3:0]};
+                    blue  = 8'd40  + {3'd0, shimmer_phase[4:0]};
+                end
             end else begin
-                red   = 8'd55;
-                green = 8'd105;
-                blue  = 8'd200;
+                // Mobil traffic/rival biasa: bodi BIRU supaya sekilas
+                // langsung terbedakan dari rintangan merah -- ini kendaraan
+                // yang berjalan searah dan bisa disalip.
+                if (riv_window) begin
+                    red   = 8'd30;
+                    green = 8'd38;
+                    blue  = 8'd55;
+                end else if (riv_taillight) begin
+                    red   = 8'd250;
+                    green = 8'd50;
+                    blue  = 8'd40;
+                end else if (riv_plate) begin
+                    red   = 8'd225;
+                    green = 8'd215;
+                    blue  = 8'd175;
+                end else if (riv_roof) begin
+                    red   = 8'd40;
+                    green = 8'd80;
+                    blue  = 8'd160;
+                end else begin
+                    red   = 8'd55;
+                    green = 8'd105;
+                    blue  = 8'd200;
+                end
             end
         end
 
@@ -4039,6 +4323,22 @@ localparam CAR_W = 10'd128;
 			red   = {bg_pixel[11:8], bg_pixel[11:8]};
 			green = {bg_pixel[7:4],  bg_pixel[7:4]};
 			blue  = {bg_pixel[3:0],  bg_pixel[3:0]};
+
+            // ---- Awan & burung. Sengaja digambar SEBELUM penyesuaian
+            // malam/salju di bawah, jadi keduanya otomatis ikut diredupkan
+            // saat kota malam dan dipucatkan saat zona salju -- tanpa perlu
+            // satu pun cabang warna tambahan.
+            if (cloud_pixel) begin
+                red   = blend4(red,   8'd252, 4'd10);
+                green = blend4(green, 8'd252, 4'd10);
+                blue  = blend4(blue,  8'd255, 4'd10);
+            end
+            if (bird_pixel) begin
+                red   = 8'd38;
+                green = 8'd40;
+                blue  = 8'd50;   // siluet gelap, kontras di langit terang
+            end
+
             if (in_night_zone) begin
                 // Kota malam: langit yang sama diredupkan separuh dengan
                 // sisa rona biru, plus taburan bintang kecil di langit
@@ -4568,6 +4868,19 @@ localparam CAR_W = 10'd128;
                 endcase
             end
 
+            // ---- Refleksi lampu jalan di aspal basah (hanya saat hujan).
+            // Sengaja dipasang sebagai BLEND di atas terrain_* yang sudah
+            // jadi, bukan cabang warna sendiri -- jadi marka putih, bercak
+            // aspal, dan tepi anti-alias di bawahnya semuanya tetap
+            // kelihatan menembus pantulan, persis seperti genangan tipis
+            // sungguhan. wet_glint bikin intensitasnya belang-belang halus
+            // dan ikut bergerak mendekat bersama aspal.
+            if (light_reflection) begin
+                terrain_r = blend4(terrain_r, 8'd245, wet_glint ? 4'd8 : 4'd4);
+                terrain_g = blend4(terrain_g, 8'd205, wet_glint ? 4'd8 : 4'd4);
+                terrain_b = blend4(terrain_b, 8'd120, wet_glint ? 4'd6 : 4'd3);
+            end
+
             // ---- Horizon fade: for the first few rows below the
             // background image, ease from the exact mountain/sky color
             // above this column into the flat terrain color computed
@@ -4609,6 +4922,15 @@ localparam CAR_W = 10'd128;
             end
         end
 
+        // ---- Salju: butiran putih jatuh pelan, hanya di zona pegunungan.
+        // Dipasang setelah hujan supaya kalau (jarang) dua-duanya kebetulan
+        // aktif, saljunya tetap terlihat di atas guratan hujan.
+        if (video_on && snow_flake) begin
+            red   = blend4(red,   8'd255, 4'd12);
+            green = blend4(green, 8'd255, 4'd12);
+            blue  = blend4(blue,  8'd255, 4'd12);
+        end
+
         // ---- Petir: sambaran cepat mencerahkan seluruh layar ke arah
         // putih-kebiruan sesaat, hanya bisa muncul saat hujan aktif.
         // Meluruh cepat (14 -> 0 dalam 14 frame) supaya terasa seperti
@@ -4627,8 +4949,9 @@ localparam CAR_W = 10'd128;
             blue  = blend4(blue,  8'd30,  hit_flash);
         end
 
-        // ---- Kilatan emas near-miss: lebih lembut dari flash merah,
-        // hadiah visual untuk dodge yang mepet.
+        // ---- Kilatan emas near-miss / VIP disalip: lebih lembut dari
+        // flash merah, hadiah visual untuk dodge yang mepet & untuk
+        // berhasil menyusul mobil VIP langka.
         if (video_on && nm_flash != 4'd0) begin
             red   = blend4(red,   8'd255, nm_flash);
             green = blend4(green, 8'd215, nm_flash);
@@ -4636,7 +4959,8 @@ localparam CAR_W = 10'd128;
         end
 
         // ---- Confetti milestone: taburan titik warna-warni yang
-        // berganti posisi tiap frame selama perayaan skor kelipatan 1000.
+        // berganti posisi tiap frame selama perayaan skor kelipatan 1000
+        // (dan saat mobil VIP berhasil disalip).
         if (video_on && confetti_px) begin
             case ({x[6] ^ shimmer_phase[1], y[6] ^ shimmer_phase[2]})
                 2'b00:  begin red = 8'd255; green = 8'd90;  blue = 8'd120; end // pink
@@ -4703,10 +5027,16 @@ localparam CAR_W = 10'd128;
                     blue  = 8'd30;
                 end
             end
-            if (lives_glyph_bit) begin
-                red   = 8'd255;
-                green = 8'd100;
-                blue  = 8'd100;   // red-ish "lives" digit
+            if (lives_heart_bit) begin
+                if (lives_heart_filled) begin
+                    red   = 8'd255;
+                    green = 8'd70;
+                    blue  = 8'd95;    // hati penuh: merah muda menyala
+                end else begin
+                    red   = 8'd72;
+                    green = 8'd38;
+                    blue  = 8'd48;    // slot kosong: merah gelap, tetap terbaca
+                end
             end
 
             if (in_dist_panel) begin
